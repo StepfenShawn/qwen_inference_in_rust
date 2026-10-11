@@ -445,7 +445,7 @@ pub(crate) fn dot_iq3_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f
     total
 }
 
-fn dot_iq3_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq3_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 98..(block + 1) * 98];
@@ -481,7 +481,7 @@ fn dot_iq3_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     total
 }
 
-fn dot_iq2_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq2_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 66..(block + 1) * 66];
@@ -511,7 +511,7 @@ fn dot_iq2_xxs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     total
 }
 
-fn dot_iq2_xs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq2_xs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 74..(block + 1) * 74];
@@ -546,7 +546,7 @@ fn dot_iq2_xs_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     total
 }
 
-fn dot_iq2_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq2_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 82..(block + 1) * 82];
@@ -577,7 +577,7 @@ fn dot_iq2_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     total
 }
 
-fn dot_iq1_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq1_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 50..(block + 1) * 50];
@@ -611,7 +611,7 @@ fn dot_iq1_s_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     total
 }
 
-fn dot_iq1_m_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_iq1_m_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let weights = &data[block * 56..(block + 1) * 56];
@@ -795,15 +795,63 @@ fn dot_iq3_s(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     dot_iq3_s_q8_k(data, q, blocks)
 }
 
+fn dot_iq1_s(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq1_s_q8_k(data, q, blocks);
+    }
+    dot_iq1_s_q8_k(data, q, blocks)
+}
+
+fn dot_iq1_m(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq1_m_q8_k(data, q, blocks);
+    }
+    dot_iq1_m_q8_k(data, q, blocks)
+}
+
+fn dot_iq2_xxs(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq2_xxs_q8_k(data, q, blocks);
+    }
+    dot_iq2_xxs_q8_k(data, q, blocks)
+}
+
+fn dot_iq2_xs(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq2_xs_q8_k(data, q, blocks);
+    }
+    dot_iq2_xs_q8_k(data, q, blocks)
+}
+
+fn dot_iq2_s(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq2_s_q8_k(data, q, blocks);
+    }
+    dot_iq2_s_q8_k(data, q, blocks)
+}
+
+fn dot_iq3_xxs(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::iq::dot_iq3_xxs_q8_k(data, q, blocks);
+    }
+    dot_iq3_xxs_q8_k(data, q, blocks)
+}
+
 /// Integer dot product between a `Q8_K` activation row and one IQ row.
 pub fn dot_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize, ty: GgmlType) -> f32 {
     match ty {
-        GgmlType::Iq1S => dot_iq1_s_q8_k(data, q, blocks),
-        GgmlType::Iq1M => dot_iq1_m_q8_k(data, q, blocks),
-        GgmlType::Iq2Xxs => dot_iq2_xxs_q8_k(data, q, blocks),
-        GgmlType::Iq2Xs => dot_iq2_xs_q8_k(data, q, blocks),
-        GgmlType::Iq2S => dot_iq2_s_q8_k(data, q, blocks),
-        GgmlType::Iq3Xxs => dot_iq3_xxs_q8_k(data, q, blocks),
+        GgmlType::Iq1S => dot_iq1_s(data, q, blocks),
+        GgmlType::Iq1M => dot_iq1_m(data, q, blocks),
+        GgmlType::Iq2Xxs => dot_iq2_xxs(data, q, blocks),
+        GgmlType::Iq2Xs => dot_iq2_xs(data, q, blocks),
+        GgmlType::Iq2S => dot_iq2_s(data, q, blocks),
+        GgmlType::Iq3Xxs => dot_iq3_xxs(data, q, blocks),
         GgmlType::Iq3S => dot_iq3_s(data, q, blocks),
         GgmlType::Iq4Xs => dot_iq4_xs(data, q, blocks),
         GgmlType::Iq4Nl => dot_iq4_nl(data, q, blocks),

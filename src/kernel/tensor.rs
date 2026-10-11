@@ -1,4 +1,4 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+﻿#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::gguf::{GgmlType, TensorEntry};
 use crate::kernel::iq;
@@ -298,7 +298,7 @@ fn dot_q6_k_scalar(data: &[u8], input: &[f32], n: usize) -> f32 {
 
 // ---- scalar dot products (Q8_K input) ----
 
-fn dot_q2_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_q2_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let b = &q[block];
@@ -362,7 +362,7 @@ pub(crate) fn dot_q3_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize
     total
 }
 
-fn dot_q4_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_q4_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let b = &q[block];
@@ -427,7 +427,7 @@ pub(crate) fn dot_q5_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize
     total
 }
 
-fn dot_q6_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+pub(crate) fn dot_q6_k_q8_k_scalar(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     let mut total = 0.0f32;
     for block in 0..blocks {
         let b = &q[block];
@@ -513,10 +513,19 @@ fn dot_q5_k_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
 }
 
 #[inline]
+fn dot_q2_k_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::avx2_fma() {
+        return crate::kernel::x86::tensor::dot_q2_k_q8_k(data, q, blocks);
+    }
+    dot_q2_k_q8_k_scalar(data, q, blocks)
+}
+
+#[inline]
 fn dot_q8_0(data: &[u8], input: &[f32], n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     // Q8_0 blocks are 32 values wide; anything else stays on the scalar path.
-    if n % 32 == 0 || super::avx2_fma_f16c() {
+    if n % 32 == 0 && super::avx2_fma_f16c() {
         return crate::kernel::x86::tensor::dot_q8_0(data, input, n);
     }
     dot_q8_0_scalar(data, input, n)
@@ -540,7 +549,7 @@ fn dot_row(data: &[u8], input: &[f32], n: usize, ty: GgmlType) -> f32 {
 
 fn dot_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize, ty: GgmlType) -> f32 {
     match ty {
-        GgmlType::Q2K => dot_q2_k_q8_k_scalar(data, q, blocks),
+        GgmlType::Q2K => dot_q2_k_q8_k(data, q, blocks),
         GgmlType::Q3K => dot_q3_k_q8_k(data, q, blocks),
         GgmlType::Q4K => dot_q4_k_q8_k(data, q, blocks),
         GgmlType::Q5K => dot_q5_k_q8_k(data, q, blocks),

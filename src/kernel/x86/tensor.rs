@@ -23,6 +23,11 @@ pub(crate) fn dot_q8_0(data: &[u8], input: &[f32], n: usize) -> f32 {
 }
 
 #[inline]
+pub(crate) fn dot_q2_k_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    unsafe { dot_q2_k_q8_k_avx2(data, q, blocks) }
+}
+
+#[inline]
 pub(crate) fn dot_q3_k_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
     unsafe { dot_q3_k_q8_k_avx2(data, q, blocks) }
 }
@@ -235,6 +240,65 @@ unsafe fn products_s8_s8_32(left: __m256i, right: __m256i) -> __m256i {
     products_u8_s8_32(magnitudes, signed_right)
 }
 
+/// `packed >> (2 * field)`, for the four 2-bit fields of a Q2_K low byte.
+///
+/// `_mm256_srli_epi16` takes its shift as a const generic, so the loop index
+/// has to be turned back into a literal here.
+#[target_feature(enable = "avx2")]
+unsafe fn q2_field_shift(packed: __m256i, field: usize) -> __m256i {
+    match field {
+        0 => packed,
+        1 => _mm256_srli_epi16::<2>(packed),
+        2 => _mm256_srli_epi16::<4>(packed),
+        _ => _mm256_srli_epi16::<6>(packed),
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn dot_q2_k_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f32 {
+    let mut accumulated = _mm256_setzero_ps();
+    let mut accumulated_min = 0.0f32;
+    for block in 0..blocks {
+        let b = &q[block];
+        let at = block * 84;
+        let scales = &data[at..at + 16];
+        let quants = &data[at + 16..at + 80];
+        let d = f16_to_f32(read_u16(&data[at + 80..])) * b.scale;
+        let dmin = f16_to_f32(read_u16(&data[at + 82..])) * b.scale;
+        let mask = _mm256_set1_epi8(3);
+        let mut weighted_lanes = _mm256_setzero_si256();
+        let mut minimum = 0i32;
+        for half in 0..2 {
+            let packed = _mm256_loadu_si256(quants[half * 32..].as_ptr() as *const __m256i);
+            for field in 0..4 {
+                let scale_index = half * 8 + field * 2;
+                let scale0 = (scales[scale_index] & 15) as i32;
+                let scale1 = (scales[scale_index + 1] & 15) as i32;
+                // The low 16 lanes hold `scale0`, the high 16 `scale1`, which
+                // matches the 16-element split of the scalar reference.
+                let quant = _mm256_and_si256(q2_field_shift(packed, field), mask);
+                let activation = _mm256_loadu_si256(
+                    b.quants[half * 128 + field * 32..].as_ptr() as *const __m256i,
+                );
+                let dot = products_u8_s8_32(quant, activation);
+                let scale =
+                    _mm256_set_m128i(_mm_set1_epi32(scale1), _mm_set1_epi32(scale0));
+                weighted_lanes =
+                    _mm256_add_epi32(weighted_lanes, _mm256_mullo_epi32(dot, scale));
+                minimum += (scales[scale_index] >> 4) as i32 * b.sums[scale_index] as i32;
+                minimum += (scales[scale_index + 1] >> 4) as i32 * b.sums[scale_index + 1] as i32;
+            }
+        }
+        accumulated = _mm256_fmadd_ps(
+            _mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(weighted_lanes),
+            accumulated,
+        );
+        accumulated_min = (-dmin).mul_add(minimum as f32, accumulated_min);
+    }
+    sum_f32_8(accumulated) + accumulated_min
+}
+
 /// `packed >> (2 * field)`, for the four 2-bit fields of a Q3_K low byte.
 ///
 /// `_mm256_srli_epi16` takes its shift as a const generic, so the loop index
@@ -397,7 +461,8 @@ mod tests {
     use crate::kernel::Q38_Q8_K_BLOCK_SIZE;
     use crate::kernel::quant::quantize_q8_k;
     use crate::kernel::tensor::{
-        dot_q3_k_q8_k_scalar, dot_q5_k_q8_k_scalar, dot_q8_0_scalar, row_bytes,
+        dot_q2_k_q8_k_scalar, dot_q3_k_q8_k_scalar, dot_q4_k_q8_k_scalar, dot_q5_k_q8_k_scalar,
+        dot_q6_k_q8_k_scalar, dot_q8_0_scalar, row_bytes,
     };
 
     const BLOCK: usize = Q38_Q8_K_BLOCK_SIZE;
@@ -427,7 +492,12 @@ mod tests {
         let mut checked = 0usize;
 
         for tensor in gguf.tensors() {
-            if tensor.n_dims != 2 || !matches!(tensor.ty, GgmlType::Q3K | GgmlType::Q5K) {
+            if tensor.n_dims != 2
+                || !matches!(
+                    tensor.ty,
+                    GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+                )
+            {
                 continue;
             }
             let key = format!("{:?}", tensor.ty);
@@ -458,6 +528,14 @@ mod tests {
                             dot_q3_k_q8_k_scalar(data, &blocks, block_count),
                             dot_q3_k_q8_k_avx2(data, &blocks, block_count),
                         ),
+                        GgmlType::Q4K => (
+                            dot_q4_k_q8_k_scalar(data, &blocks, block_count),
+                            dot_q4_k_q8_k_avx2(data, &blocks, block_count),
+                        ),
+                        GgmlType::Q6K => (
+                            dot_q6_k_q8_k_scalar(data, &blocks, block_count),
+                            dot_q6_k_q8_k_avx2(data, &blocks, block_count),
+                        ),
                         _ => (
                             dot_q5_k_q8_k_scalar(data, &blocks, block_count),
                             dot_q5_k_q8_k_avx2(data, &blocks, block_count),
@@ -473,7 +551,42 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 4, "only {checked} rows exercised");
+        assert!(checked >= 8, "only {checked} rows exercised");
+    }
+
+    /// `Q2_K` is absent from the reference model, so this test builds its own
+    /// blocks: random bytes with both f16 scales pinned finite.
+    #[test]
+    fn avx2_matches_scalar_q2_k() {
+        if !avx2_available() {
+            println!("AVX2 + FMA unavailable; skipping");
+            return;
+        }
+        let blocks = 16usize;
+        let block_bytes = 84usize;
+        let mut data = vec![0u8; blocks * block_bytes];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = ((i * 7919) % 251) as u8;
+        }
+        for block in 0..blocks {
+            let at = block * block_bytes;
+            let d = 0x3800u16 | ((block as u16 * 3) & 0x03ff);
+            let dmin = 0x3800u16 | ((block as u16 * 7) & 0x03ff);
+            data[at + 80..at + 82].copy_from_slice(&d.to_le_bytes());
+            data[at + 82..at + 84].copy_from_slice(&dmin.to_le_bytes());
+        }
+
+        let x = activation(blocks * BLOCK);
+        let mut quantized = (0..blocks)
+            .map(|_| Q38Q8KBlock::default())
+            .collect::<Vec<_>>();
+        quantize_q8_k(&mut quantized, &x).unwrap();
+
+        let scalar = dot_q2_k_q8_k_scalar(&data, &quantized, blocks);
+        let vector = unsafe { dot_q2_k_q8_k_avx2(&data, &quantized, blocks) };
+        let rel = relative(vector, scalar);
+        println!("Q2_K: scalar={scalar} avx2={vector} rel={rel:.3e}");
+        assert!(rel < 1e-5, "Q2_K: avx2 {vector} vs scalar {scalar}");
     }
 
     #[test]

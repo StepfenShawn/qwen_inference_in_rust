@@ -1,5 +1,5 @@
 # qwen3.8_27b_in_rust
-Run the Qwen3.8 27B LLM on one laptop CPU. Written in pure rust: no BLAS, no framework, no GPU!  
+Run the Qwen3.8 27B LLM on one laptop CPU at ~3.7 tok/s. Written in pure rust: no BLAS, no framework, no GPU!  
 
 # Requirements
 | | |
