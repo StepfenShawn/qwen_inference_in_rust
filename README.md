@@ -1,6 +1,8 @@
 # qwen3.8_27b_in_rust
 Run the Qwen3.8 27B LLM on one laptop CPU at ~3.7 tok/s. Written in pure rust: no BLAS, no framework, no GPU!  
 
+![Qwen3.8 arch](docs/images/qwen38_architecture.png)
+
 # Requirements
 | | |
 | --- | --- |
@@ -31,9 +33,6 @@ example:
 ```
 > ./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello --max-tokens 256 --context 256 --no-thinking
 Hello! How can I help you today?
-[prompt=13 tokens, output=9 tokens, threads=12, elapsed=158.583s
- TTFT=19.100s
- TPOT=15.323s
 ```
 
 # Build
