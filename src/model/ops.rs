@@ -33,6 +33,52 @@ use rayon::prelude::*;
 
 const BLOCK: usize = Q38_Q8_K_BLOCK_SIZE;
 
+/// One recurrent ("linear attention") layer keeps two pieces of state: the
+/// short convolution window and the DeltaNet per-head matrix.
+const CONV_LAYER_STATE: usize = Q38_LINEAR_QKV_DIM * 3;
+const DELTA_LAYER_STATE: usize =
+    Q38_LINEAR_V_HEADS * Q38_LINEAR_HEAD_DIM * Q38_LINEAR_HEAD_DIM;
+const CONV_STATE_LEN: usize = Q38_RECURRENT_LAYERS * CONV_LAYER_STATE;
+const DELTA_STATE_LEN: usize = Q38_RECURRENT_LAYERS * DELTA_LAYER_STATE;
+
+/// Opt-in diagnostics for the speculative path: set `Q38_SPEC_TRACE=1`.
+fn spec_trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("Q38_SPEC_TRACE").is_some() {
+        eprintln!("qwen38: spec {args}");
+    }
+}
+
+/// Rolling copies of the recurrent state, one slot per committed position.
+///
+/// A drafted batch advances the convolution and DeltaNet state token by token,
+/// so after `n` positions the live state belongs to the last drafted token,
+/// not to the verified prefix. Copying each layer's slice as the batch walks
+/// forward costs `CONV_STATE_LEN + DELTA_STATE_LEN` floats per slot (~157 MB),
+/// i.e. a few milliseconds, instead of the full weight re-read (~15 GB) that a
+/// prefix re-run would need.
+struct StateSnapshots<'a> {
+    conv: &'a mut [f32],
+    delta: &'a mut [f32],
+    slots: usize,
+}
+
+impl<'a> StateSnapshots<'a> {
+    fn new(conv: &'a mut [f32], delta: &'a mut [f32], slots: usize) -> Self {
+        Self { conv, delta, slots }
+    }
+
+    /// Record the state of recurrent layer `index` after position `slot`.
+    fn capture(&mut self, slot: usize, index: usize, conv: &[f32], delta: &[f32]) {
+        if slot >= self.slots {
+            return;
+        }
+        let conv_at = slot * CONV_STATE_LEN + index * CONV_LAYER_STATE;
+        self.conv[conv_at..conv_at + CONV_LAYER_STATE].copy_from_slice(conv);
+        let delta_at = slot * DELTA_STATE_LEN + index * DELTA_LAYER_STATE;
+        self.delta[delta_at..delta_at + DELTA_LAYER_STATE].copy_from_slice(delta);
+    }
+}
+
 /// Full-attention layers sit at every fourth position, and the MTP block lives
 /// past the end of the base stack.
 #[inline]
@@ -1035,6 +1081,7 @@ fn batch_linear_attention(
     batch: &mut Q38BatchScratch,
     layer: usize,
     count: usize,
+    snapshots: Option<&mut StateSnapshots<'_>>,
 ) -> Result<(), i32> {
     let Q38Attention::Linear {
         qkv,
@@ -1085,6 +1132,7 @@ fn batch_linear_attention(
     let conv_base = index * Q38_LINEAR_QKV_DIM * 3;
     let delta_base = index * Q38_LINEAR_V_HEADS * Q38_LINEAR_HEAD_DIM * Q38_LINEAR_HEAD_DIM;
     let delta_len = Q38_LINEAR_V_HEADS * Q38_LINEAR_HEAD_DIM * Q38_LINEAR_HEAD_DIM;
+    let mut snapshots = snapshots;
     for token in 0..count {
         linear_core(
             &model.layers[layer],
@@ -1096,6 +1144,16 @@ fn batch_linear_attention(
             &mut batch.alpha[token * Q38_LINEAR_V_HEADS..][..Q38_LINEAR_V_HEADS],
             &mut batch.attention[token * Q38_LINEAR_V_DIM..][..Q38_LINEAR_V_DIM],
         )?;
+        if let Some(snapshots) = snapshots.as_mut() {
+            if token < snapshots.slots {
+                snapshots.capture(
+                    token,
+                    index,
+                    &model.conv_state[conv_base..conv_base + CONV_LAYER_STATE],
+                    &model.delta_state[delta_base..delta_base + DELTA_LAYER_STATE],
+                );
+            }
+        }
     }
 
     batch_quantize(
@@ -1193,6 +1251,7 @@ fn batch_layer(
     layer: usize,
     count: usize,
     base_position: u32,
+    snapshots: Option<&mut StateSnapshots<'_>>,
 ) -> Result<(), i32> {
     batch_norm(
         &mut batch.norm,
@@ -1203,7 +1262,7 @@ fn batch_layer(
     if is_full_attention(layer) {
         batch_full_attention(model, batch, layer, count, base_position)?;
     } else {
-        batch_linear_attention(model, batch, layer, count)?;
+        batch_linear_attention(model, batch, layer, count, snapshots)?;
     }
     accumulate(&mut batch.hidden, &batch.branch, count * Q38_HIDDEN);
 
@@ -1488,6 +1547,11 @@ impl<'a> Q38Model<'a> {
             delta_state: vec![0.0f32; delta_count],
             key_cache: vec![0.0f32; kv_count],
             value_cache: vec![0.0f32; kv_count],
+            rollback_conv_state: Vec::new(),
+            rollback_delta_state: Vec::new(),
+            spec_drafted: 0,
+            spec_matched: 0,
+            spec_batches: 0,
             scratch: alloc_scratch(context_length),
         };
 
@@ -1624,7 +1688,11 @@ impl<'a> Q38Model<'a> {
         Ok(())
     }
 
-    /// Snapshot everything `speculative_greedy` may have to roll back.
+    /// Full copy of the recurrent state, taken before a speculative batch.
+    ///
+    /// The common rollback (a partially accepted batch) uses the much cheaper
+    /// per-position snapshots; this one is the fallback for "nothing at all was
+    /// committed", where no snapshot exists.
     fn checkpoint_state(&mut self) {
         self.checkpoint_conv_state.clear();
         self.checkpoint_conv_state
@@ -1644,6 +1712,26 @@ impl<'a> Q38Model<'a> {
         self.delta_state
             .copy_from_slice(&self.checkpoint_delta_state);
         self.position = self.checkpoint_position;
+    }
+
+    /// Rewind the recurrent state to the copy taken after `steps` positions of
+    /// the current speculative batch. `steps == 1..=draft_count - 1`, i.e. the
+    /// shortest possible committed prefix up to (but excluding) the full batch,
+    /// which needs no rewind at all.
+    fn restore_target_state_from_snapshot(&mut self, steps: usize) {
+        if steps == 0 {
+            self.restore_target_state();
+            return;
+        }
+        let slot = steps - 1;
+        let conv_at = slot * CONV_STATE_LEN;
+        let delta_at = slot * DELTA_STATE_LEN;
+        self.conv_state
+            .copy_from_slice(&self.rollback_conv_state[conv_at..conv_at + CONV_STATE_LEN]);
+        self.delta_state.copy_from_slice(
+            &self.rollback_delta_state[delta_at..delta_at + DELTA_STATE_LEN],
+        );
+        self.position = self.checkpoint_position + steps as u32;
     }
 
     fn restore_mtp_state(&mut self) {
@@ -1755,7 +1843,7 @@ impl<'a> Q38ModelOps<'a> for Q38Model<'a> {
                 .map_err(|_| -1)?;
         }
         for layer in 0..Q38_LAYERS {
-            batch_layer(self, &mut batch, layer, count, base_position)?;
+            batch_layer(self, &mut batch, layer, count, base_position, None)?;
         }
         let output_norm = self.output_norm;
         batch_norm(&mut batch.target_norm, &batch.hidden, output_norm, count);
@@ -1873,6 +1961,13 @@ impl<'a> Q38ModelOps<'a> for Q38Model<'a> {
             || draft_count > self.context_length - self.position
             || accepted.len() < draft_count as usize
         {
+            spec_trace(format_args!(
+                "guard rejected: position={} mtp_position={} draft={} accepted={}",
+                self.position,
+                self.mtp_position,
+                draft_count,
+                accepted.len()
+            ));
             return Err(-1);
         }
 
@@ -1896,6 +1991,7 @@ impl<'a> Q38ModelOps<'a> for Q38Model<'a> {
                     }
                 }
                 Err(_) => {
+                    spec_trace(format_args!("draft failed at position {actual_count}"));
                     self.restore_mtp_state();
                     return Err(-1);
                 }
@@ -1907,13 +2003,45 @@ impl<'a> Q38ModelOps<'a> for Q38Model<'a> {
             inputs[i] = drafts[i - 1];
         }
         let mut batch = Q38BatchScratch::new(capacity);
-        let mut ok = batch_target_eval(
-            self,
-            &mut batch,
-            &inputs[..actual_count],
-            &mut batch_logits[..actual_count * Q38_VOCAB],
-        )
-        .is_ok();
+
+        // Snapshot the recurrent state after every position but the last: the
+        // committed prefix can end anywhere in `1..=actual_count - 1`. The
+        // prefix logits need no snapshot at all — attention and the recurrence
+        // are causal, so `batch_logits[p]` is already what a prefix-only run
+        // would produce.
+        let slots = actual_count.saturating_sub(1);
+        let conv_need = slots * CONV_STATE_LEN;
+        let delta_need = slots * DELTA_STATE_LEN;
+        if self.rollback_conv_state.len() < conv_need {
+            self.rollback_conv_state.resize(conv_need, 0.0);
+        }
+        if self.rollback_delta_state.len() < delta_need {
+            self.rollback_delta_state.resize(delta_need, 0.0);
+        }
+        // `batch_target_eval` borrows the model mutably, so the snapshot
+        // buffers travel as owned locals for the duration of the call.
+        let mut conv_buffer = std::mem::take(&mut self.rollback_conv_state);
+        let mut delta_buffer = std::mem::take(&mut self.rollback_delta_state);
+        let mut ok = {
+            let mut snapshots = StateSnapshots::new(
+                &mut conv_buffer[..conv_need],
+                &mut delta_buffer[..delta_need],
+                slots,
+            );
+            batch_target_eval(
+                self,
+                &mut batch,
+                &inputs[..actual_count],
+                &mut batch_logits[..actual_count * Q38_VOCAB],
+                Some(&mut snapshots),
+            )
+            .is_ok()
+        };
+        self.rollback_conv_state = conv_buffer;
+        self.rollback_delta_state = delta_buffer;
+        if !ok {
+            spec_trace(format_args!("target batch failed ({actual_count} tokens)"));
+        }
 
         let mut matched = 0usize;
         let mut next = 0u32;
@@ -1936,24 +2064,27 @@ impl<'a> Q38ModelOps<'a> for Q38Model<'a> {
             actual_count
         };
 
-        // The rejected tail must not stay in the recurrent state, so re-run
-        // only the committed prefix from the checkpoint.
+        // The rejected tail must not stay in the recurrent state. Rewinding a
+        // snapshot costs ~157 MB of memcpy instead of a full re-forward pass
+        // over every weight, so a partially accepted batch is now nearly as
+        // cheap as a fully accepted one.
         if ok && consumed < actual_count {
-            self.restore_target_state();
-            ok = batch_target_eval(
-                self,
-                &mut batch,
-                &inputs[..consumed],
-                &mut batch_logits[..consumed * Q38_VOCAB],
-            )
-            .is_ok();
+            self.restore_target_state_from_snapshot(consumed);
         }
         if ok {
+            self.spec_batches += 1;
+            self.spec_drafted += actual_count as u64;
+            self.spec_matched += matched as u64;
             let last = &batch_logits[(consumed - 1) * Q38_VOCAB..][..Q38_VOCAB];
             self.scratch.logits.copy_from_slice(last);
             self.restore_mtp_state();
             let base = self.checkpoint_mtp_position;
             ok = mtp_catchup(self, &mut batch, &inputs[..consumed], base).is_ok();
+            if !ok {
+                spec_trace(format_args!(
+                    "mtp catchup failed at base={base} consumed={consumed}"
+                ));
+            }
         }
 
         if ok {
@@ -1991,6 +2122,7 @@ fn batch_target_eval(
     batch: &mut Q38BatchScratch,
     tokens: &[u32],
     logits: &mut [f32],
+    mut snapshots: Option<&mut StateSnapshots<'_>>,
 ) -> Result<(), i32> {
     let count = tokens.len();
     if count == 0 || logits.len() < count * Q38_VOCAB {
@@ -2010,7 +2142,8 @@ fn batch_target_eval(
     }
     let base_position = model.position;
     for layer in 0..Q38_LAYERS {
-        batch_layer(model, batch, layer, count, base_position)?;
+        let layer_snapshots = snapshots.as_mut().map(|state| &mut **state);
+        batch_layer(model, batch, layer, count, base_position, layer_snapshots)?;
     }
     let output_norm = model.output_norm;
     let output = model.output;
@@ -2052,8 +2185,6 @@ mod tests {
             .unwrap_or_else(|| vec![1, 4, 16, 32, 48, 64])
     }
 
-    /// Mirrors `c_repo/src/cli/qwen38_forward_probe.c` so the two
-    /// implementations can be diffed layer by layer.
     #[test]
     fn forward_layer_probe() {
         let gguf = Gguf::open("Qwen3.8-27B-UD-Q4_K_M.gguf").unwrap();
@@ -2074,66 +2205,107 @@ mod tests {
         }
     }
 
-    /// Dumps the next-token distribution for real prompts.
-    ///
-    /// A correct model puts the mass on a plausible continuation. A degenerate
-    /// one shows it immediately: `NaN`/`inf` entries, an essentially flat
-    /// distribution, or a special token (like EOS) winning the argmax on every
-    /// prompt regardless of the question.
-    ///
-    /// Runs one prompt per weight pass, and a pass is memory-bandwidth bound,
-    /// so this takes minutes rather than seconds.
-    #[test]
-    fn logits_probe() {
-        let gguf = Gguf::open("Qwen3.8-27B-UD-Q4_K_M.gguf").unwrap();
-        let tokenizer = crate::tokenizer::build_tokenizer_from_gguf(&gguf).unwrap();
-        let eos = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(0);
-        println!("eos={eos} vocab={}", Q38_VOCAB);
-
-        let prompts: [(&str, &str); 3] = [
-            (
-                "arithmetic, thinking off",
-                "<|im_start|>user\n1+1等于几？只回答数字。<|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n\n</think>\n\n",
-            ),
-            (
-                "arithmetic, thinking on",
-                "<|im_start|>user\n1+1等于几？<|im_end|>\n<|im_start|>assistant\n<think>\n",
-            ),
-            (
-                "factual, thinking off",
-                "<|im_start|>user\n中国的首都是哪座城市？只回答城市名。<|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n\n</think>\n\n",
-            ),
-        ];
-
-        let mut model = Q38Model::open_gguf(&gguf, 256).unwrap();
-        for (label, prompt) in prompts {
-            model.reset();
-            let ids: Vec<u32> = tokenizer.encode(prompt, false).unwrap().get_ids().to_vec();
-            let logits = model.prefill(&ids).unwrap().to_vec();
-
-            let finite = logits.iter().filter(|value| value.is_finite()).count();
-            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mean = logits.iter().map(|value| *value as f64).sum::<f64>() / logits.len() as f64;
-            let sd = (logits
+    fn assert_same_bits(actual: &[f32], expected: &[f32], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: length differs");
+        let first = actual
+            .iter()
+            .zip(expected)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        if let Some(at) = first {
+            let bad = actual
                 .iter()
-                .map(|value| (*value as f64 - mean).powi(2))
-                .sum::<f64>()
-                / logits.len() as f64)
-                .sqrt();
-
-            println!(
-                "\n== {label} == {} tokens, finite={finite}, max={max:.3}, mean={mean:.3}, sd={sd:.3}",
-                ids.len()
+                .zip(expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            panic!(
+                "{what}: {bad} of {} values differ, first at {at}: {} vs {}",
+                actual.len(),
+                actual[at],
+                expected[at]
             );
-            let mut order: Vec<u32> = (0..logits.len() as u32).collect();
-            order.sort_by(|a, b| logits[*b as usize].total_cmp(&logits[*a as usize]));
-            for &id in order.iter().take(8) {
-                let text = tokenizer.decode(&[id], false).unwrap_or_default();
-                let logit = logits[id as usize];
-                println!("  {id:>7} {logit:>10.4}  {text:?}");
-            }
         }
+    }
+
+    /// A partially accepted speculative batch must leave behind exactly the
+    /// state a prefix-only run would leave — that is the invariant which lets
+    /// `speculative_greedy` skip the full re-forward on a rollback.
+    ///
+    /// Both paths start from the same checkpoint; only the way they reach
+    /// position `base + 2` differs (batch of three and then a snapshot rewind,
+    /// versus a plain two-token run). Costs a few weight passes, so it is slow
+    /// on a machine that cannot keep the model resident.
+    #[test]
+    fn snapshot_rollback_matches_prefix_rerun() {
+        let path = "Qwen3.8-27B-UD-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() {
+            println!("{path} not found; skipping");
+            return;
+        }
+        let gguf = Gguf::open(path).unwrap();
+        let mut model = Q38Model::open_gguf(&gguf, 32).unwrap();
+        if model.enable_mtp().is_err() {
+            println!("checkpoint has no MTP head; skipping");
+            return;
+        }
+        let prompt: Vec<u32> = (100..108).collect();
+        let _ = model.prefill(&prompt).unwrap();
+        let base = model.position;
+
+        let tokens: Vec<u32> = vec![200, 201, 202];
+        let slots = tokens.len() - 1;
+        model.rollback_conv_state = vec![0.0f32; slots * CONV_STATE_LEN];
+        model.rollback_delta_state = vec![0.0f32; slots * DELTA_STATE_LEN];
+
+        // Path A: one three-token batch that records a snapshot per position,
+        // then a rewind to the two-token prefix.
+        model.checkpoint_state();
+        let mut batch = Q38BatchScratch::new(tokens.len());
+        let mut logits = vec![0.0f32; tokens.len() * Q38_VOCAB];
+        let mut conv_buffer = std::mem::take(&mut model.rollback_conv_state);
+        let mut delta_buffer = std::mem::take(&mut model.rollback_delta_state);
+        {
+            let mut snapshots = StateSnapshots::new(&mut conv_buffer, &mut delta_buffer, slots);
+            batch_target_eval(
+                &mut model,
+                &mut batch,
+                &tokens,
+                &mut logits,
+                Some(&mut snapshots),
+            )
+            .unwrap();
+        }
+        model.rollback_conv_state = conv_buffer;
+        model.rollback_delta_state = delta_buffer;
+        let batch_position = model.position;
+        assert_eq!(batch_position, base + tokens.len() as u32);
+
+        model.restore_target_state_from_snapshot(2);
+        assert_eq!(model.position, base + 2);
+        let rolled_conv = model.conv_state.clone();
+        let rolled_delta = model.delta_state.clone();
+        let rolled_logits = logits[..2 * Q38_VOCAB].to_vec();
+
+        // Path B: same checkpoint, prefix only.
+        model.restore_target_state();
+        assert_eq!(model.position, base);
+        let mut prefix_batch = Q38BatchScratch::new(2);
+        let mut prefix_logits = vec![0.0f32; 2 * Q38_VOCAB];
+        batch_target_eval(
+            &mut model,
+            &mut prefix_batch,
+            &tokens[..2],
+            &mut prefix_logits,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(model.position, base + 2);
+        assert_same_bits(&rolled_conv, &model.conv_state, "conv_state");
+        assert_same_bits(&rolled_delta, &model.delta_state, "delta_state");
+        assert_same_bits(&rolled_logits, &prefix_logits, "prefix logits");
+        println!(
+            "conv={} delta={} floats match bit for bit",
+            CONV_STATE_LEN, DELTA_STATE_LEN
+        );
     }
 }

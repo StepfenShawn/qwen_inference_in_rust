@@ -1,6 +1,15 @@
 /// Number of weights per Q8_K block.
 pub const Q38_Q8_K_BLOCK_SIZE: usize = 256;
 
+/// Tokens a fused `*_tile` kernel feeds from a single weight decode.
+///
+/// A batched projection re-reads (and re-unpacks) the same weight row once per
+/// token in the plain `dot_*_q8_k` path. The tile kernels hoist everything that
+/// depends only on the weights — nibble split, 2/3/4-bit field assembly, the
+/// 6-bit K-quant scales — out of the token loop, so four tokens cost one decode
+/// plus four `maddubs`/`madd` chains.
+pub const Q38_Q8_K_TILE: usize = 4;
+
 /// Work, in element-operations, below which a loop stays on the calling thread.
 pub const Q38_PARALLEL_MIN_WORK: usize = 1 << 18;
 
@@ -141,4 +150,10 @@ pub fn avx2_fma() -> bool {
 #[inline]
 pub fn avx2_fma_f16c() -> bool {
     avx2_fma() && std::arch::is_x86_feature_detected!("f16c")
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn neon() -> bool {
+    std::arch::is_aarch64_feature_detected!("neon")
 }

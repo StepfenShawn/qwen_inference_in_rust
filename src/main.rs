@@ -29,6 +29,7 @@ struct Options {
     presence_penalty: f32,
     thinking: bool,
     reasoning_effort: i32,
+    mtp_draft: u32,
     threads: Option<usize>,
 }
 
@@ -51,6 +52,7 @@ impl Default for Options {
             presence_penalty: 0.0,
             thinking: true,
             reasoning_effort: EFFORT_XHIGH,
+            mtp_draft: 0,
             threads: None,
         }
     }
@@ -71,6 +73,7 @@ fn usage() {
          \x20 --reasoning-effort N  low, medium, or xhigh (default: xhigh)\n\
          \x20 --threads N         worker threads for the kernels (default: one per core,\n\
          \x20                     also honoured through RAYON_NUM_THREADS)\n\
+         \x20 --mtp-draft N       greedy speculative decoding with N drafts (0 = off)\n\
          \x20 --seed N            sampling seed"
     );
 }
@@ -134,7 +137,12 @@ fn parse_args() -> Result<Options, String> {
                     "xhigh" => EFFORT_XHIGH,
                     _ => return Err("invalid --reasoning-effort".to_string()),
                 };
-            }
+            },
+            "--mtp-draft" => {
+                opts.mtp_draft = next("--mtp-draft")?
+                    .parse()
+                    .map_err(|_| "invalid --mtp-draft".to_string())?;
+            },
             "--no-thinking" => opts.thinking = false,
             "--threads" => {
                 let threads: usize = next("--threads")?
@@ -218,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Err(error) = gguf.prepare_iq1_s_repacks() {
         eprintln!("qwen38: IQ1 runtime repack unavailable; using packed weights ({error})");
     }
-    let tokenizer = tokenizer::build_tokenizer_from_gguf(&gguf)?;
+    let (tokenizer, mut decoder) = tokenizer::build_tokenizer_and_decoder_from_gguf(&gguf)?;
     let eos = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(0);
 
     let control_tokens: HashSet<u32> = tokenizer::get_all_control_token_ids(&gguf)
@@ -228,6 +236,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut model =
         Q38Model::open_gguf(&gguf, options.context).map_err(|_| "unable to open model")?;
+
+    if options.mtp_draft > 0 {
+        model.enable_mtp().map_err(|_| {
+            "MTP head unavailable: checkpoint must carry blk.64.nextn.*"
+        })?;
+        eprintln!("qwen38: MTP speculative decoding on (draft={})", options.mtp_draft);
+    }
 
     let prompt = render_prompt(
         options.prompt.as_deref().unwrap(),
@@ -255,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let started = Instant::now();
-    let mut logits = model.prefill(&ids).map_err(|_| "prefill failed")?;
+    let logits = model.prefill(&ids).map_err(|_| "prefill failed")?;
     let mut first_ready: Option<Instant> = None;
     let mut last_ready = started;
     let mut generated = 0u32;
@@ -266,34 +281,87 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut closed_thinking = !options.thinking;
 
+    macro_rules! emit {
+        ($token:expr) => {{
+            let token: u32 = $token;
+            if token == eos {
+                false
+            } else {
+                if generated == 0 {
+                    first_ready = Some(Instant::now());
+                }
+                sampler.observe(token);
+                if !control_tokens.contains(&token) {
+                    let text = decoder.push(token);
+                    if !text.is_empty() {
+                        print!("{text}");
+                        io::stdout().flush().ok();
+                    }
+                }
+                if Some(token) == think_close {
+                    closed_thinking = true;
+                }
+                generated += 1;
+                last_ready = Instant::now();
+                true
+            }
+        }};
+    }
+
+    let mut accepted = vec![0u32; options.mtp_draft as usize + 1];
+    let mut pending = sampler.sample(logits);
     while generated < options.max_tokens {
-        let token = sampler.sample(logits);
-        sampler.observe(token);
-        if token == eos {
+        if !emit!(pending) {
             break;
         }
-        if generated == 0 {
-            first_ready = Some(Instant::now());
+        // `emit!` may have just filled the budget; drafting with zero slots
+        // would otherwise reach `speculative_greedy` and be rejected there.
+        if generated >= options.max_tokens {
+            break;
         }
-        // the size of `control_tokens` is `27`, we dont need to care about perfermance here!
-        if !control_tokens.contains(&token) {
-            let text = tokenizer.decode(&[token], false)?;
-            print!("{text}");
-            io::stdout().flush().ok();
-        }
-        if Some(token) == think_close {
-            closed_thinking = true;
-        }
-        generated += 1;
-        last_ready = Instant::now();
-        if model.position() >= model.context_length() {
+        let room = model.context_length() - model.position();
+        if room == 0 {
             eprintln!(
                 "qwen38: context is full ({} positions); restart with a larger --context",
                 model.context_length()
             );
             break;
         }
-        logits = model.forward_token(token).map_err(|_| "forward failed")?;
+    
+        if options.mtp_draft == 0 {
+            let logits = model.forward_token(pending).map_err(|_| "forward failed")?;
+            pending = sampler.sample(logits);
+            continue;
+        }
+    
+        // draft 必须 <= 剩余 context（内核会校验）且 <= 剩余预算
+        let draft = options.mtp_draft.min(options.max_tokens - generated).min(room);
+        let (_, consumed) = model
+            .speculative_greedy(pending, eos, draft, &mut accepted[..draft as usize])
+            .map_err(|_| "speculative decode failed")?;
+    
+        // `accepted` 里最后一个 token 还没有送进 target，下一轮它才会作为
+        // `pending` 被输出；所以本轮只打印前 n-1 个，否则它会被打两遍。
+        let n = consumed as usize;
+        debug_assert!(n >= 1);
+        let mut halted = false;
+        for &token in &accepted[..n - 1] {
+            if generated >= options.max_tokens || !emit!(token) {
+                halted = true;
+                break;
+            }
+        }
+        if halted {
+            break;
+        }
+        pending = accepted[n - 1]; // 最后一个尚未 forward
+    }
+
+    // 收尾：把最后一个 token 里没凑成完整字符的残字节冲出来
+    let tail = decoder.finish();
+    if !tail.is_empty() {
+        print!("{tail}");
+        io::stdout().flush().ok();
     }
 
     let truncated = generated >= options.max_tokens;
@@ -320,6 +388,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let tpot = last_ready.duration_since(first).as_secs_f64() / (generated - 1) as f64;
             eprintln!(" TPOT={tpot:.3}s");
         }
+    }
+    if options.mtp_draft > 0 && model.spec_batches > 0 {
+        let drafted = model.spec_drafted.max(1) as f64;
+        eprintln!(
+            " MTP acceptance={:.1}% ({}/{} drafts confirmed in {} batches, {:.2} tokens/batch)",
+            model.spec_matched as f64 / drafted * 100.0,
+            model.spec_matched,
+            model.spec_drafted,
+            model.spec_batches,
+            generated as f64 / model.spec_batches as f64,
+        );
     }
     if truncated {
         eprintln!(

@@ -28,11 +28,17 @@ qwen38_27b_in_rust --model MODEL.gguf [--prompt TEXT] [options]
   --threads N         worker threads for the kernels (default: one per core,
                       also honoured through RAYON_NUM_THREADS)
   --seed N            sampling seed
+  --mtp-draft N       greedy speculative decoding with N drafts (0 = off)
 ```
 example:  
 ```
 > ./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello --max-tokens 256 --context 256 --no-thinking
 Hello! How can I help you today?
+```
+speculative decoding(speedup ~1.8×):  
+```
+./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello \
+  --max-tokens 256 --context 1024 --temperature 0 --mtp-draft 3
 ```
 
 # Build

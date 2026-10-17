@@ -157,6 +157,20 @@ pub struct Q38Model<'a> {
     pub key_cache: Vec<f32>,
     pub value_cache: Vec<f32>,
 
+    /// Per-position copies of the recurrent state. `speculative_greedy` only
+    /// commits the verified prefix of a drafted batch, so it needs the state
+    /// that belongs to that prefix — not the one the whole batch leaves
+    /// behind. Capturing it while the batch runs beats re-reading every
+    /// weight to recompute the prefix.
+    pub rollback_conv_state: Vec<f32>,
+    pub rollback_delta_state: Vec<f32>,
+
+    /// Speculative decoding counters: drafts produced, drafts the target
+    /// confirmed, and how many batches ran.
+    pub spec_drafted: u64,
+    pub spec_matched: u64,
+    pub spec_batches: u64,
+
     pub scratch: Q38Scratch,
 }
 

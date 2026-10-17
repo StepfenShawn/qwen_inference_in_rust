@@ -4,7 +4,8 @@ use crate::gguf::{GgmlType, TensorEntry};
 use crate::kernel::iq;
 use crate::kernel::quant::{bf16_to_f32, f16_to_f32};
 use crate::kernel::{
-    Q38_Q8_K_BLOCK_SIZE, Q38CoreError, Q38CoreResult, Q38Q8KBlock, Q38TensorOps, q38_parallel_over,
+    Q38_Q8_K_BLOCK_SIZE, Q38_Q8_K_TILE, Q38CoreError, Q38CoreResult, Q38Q8KBlock, Q38TensorOps,
+    q38_parallel_over,
 };
 use rayon::prelude::*;
 
@@ -559,6 +560,112 @@ fn dot_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize, ty: GgmlType) -> f32 
     }
 }
 
+/// Fused counterpart of [`dot_q8_k`]: the same weight row against `lanes`
+/// consecutive token slabs, laid out token-major
+/// (`activations[lane * blocks + block]`).
+fn dot_q8_k_tile(
+    data: &[u8],
+    activations: &[Q38Q8KBlock],
+    blocks: usize,
+    lanes: usize,
+    ty: GgmlType,
+    out: &mut [f32; Q38_Q8_K_TILE],
+) {
+    debug_assert!(lanes > 0 && lanes <= Q38_Q8_K_TILE);
+    debug_assert!(activations.len() >= lanes * blocks && blocks > 0);
+    #[cfg(target_arch = "x86_64")]
+    if tile_kernels_available() {
+        match ty {
+            GgmlType::Q2K => {
+                return unsafe {
+                    crate::kernel::x86::tensor::dot_q2_k_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            GgmlType::Q3K => {
+                return unsafe {
+                    crate::kernel::x86::tensor::dot_q3_k_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            GgmlType::Q4K => {
+                return unsafe {
+                    crate::kernel::x86::tensor::dot_q4_k_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            GgmlType::Q5K => {
+                return unsafe {
+                    crate::kernel::x86::tensor::dot_q5_k_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            GgmlType::Q6K => {
+                return unsafe {
+                    crate::kernel::x86::tensor::dot_q6_k_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            GgmlType::Iq4Xs => {
+                return unsafe {
+                    crate::kernel::x86::iq::dot_iq4_xs_q8_k_tile_avx2(
+                        data,
+                        activations,
+                        blocks,
+                        lanes,
+                        out,
+                    )
+                };
+            }
+            _ => {}
+        }
+    }
+    for lane in 0..lanes {
+        out[lane] = dot_q8_k(
+            data,
+            &activations[lane * blocks..(lane + 1) * blocks],
+            blocks,
+            ty,
+        );
+    }
+}
+
+/// Fused kernels need AVX2, and `Q38_TILE=0` forces the per-token path so the
+/// two can be compared on the same binary.
+#[cfg(target_arch = "x86_64")]
+fn tile_kernels_available() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("Q38_TILE") {
+        Ok(value) => !matches!(value.as_str(), "0" | "off" | "false"),
+        Err(_) => true,
+    })
+}
+
 fn dequantize_quant_row(data: &[u8], output: &mut [f32], ty: GgmlType) {
     if iq::supports_f32(ty) {
         iq::dequantize_row(data, output, ty);
@@ -933,6 +1040,76 @@ mod tests {
             );
         }
     }
+
+    /// The fused tile path only hoists the weight decode; it must not change a
+    /// single bit of the result. Batch sizes straddle the tile width so the
+    /// full tiles, the ragged tail and the single-token fallback are all
+    /// exercised (`5 = 4 + 1` takes both).
+    #[test]
+    fn tile_gemm_matches_per_token_dot() {
+        let gguf = Gguf::open("Qwen3.8-27B-UD-Q4_K_M.gguf").unwrap();
+        let batches = [2usize, 3, 4, 5, 7, 8];
+        let probes = [0usize, 1, 7];
+        let mut seen: Vec<String> = Vec::new();
+
+        for tensor in gguf.tensors() {
+            if tensor.n_dims != 2 || !supported_q8_k(tensor.ty) {
+                continue;
+            }
+            let width = tensor.shape[0] as usize;
+            if width == 0 || width % BLOCK != 0 || tensor.shape[1] < 8 {
+                continue;
+            }
+            let key = format!("{:?}", tensor.ty);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key.clone());
+
+            let rows = tensor.shape[1] as usize;
+            let rbytes = row_bytes(tensor.ty, width).unwrap();
+            let blocks = width / BLOCK;
+            let x = activation(width);
+            let row_of = |row: usize| &tensor.data[row * rbytes..(row + 1) * rbytes];
+
+            for &batch in &batches {
+                let mut wide: Vec<Q38Q8KBlock> = (0..batch * blocks)
+                    .map(|_| Q38Q8KBlock::default())
+                    .collect();
+                for token in 0..batch {
+                    let mut per_token = x.clone();
+                    for value in per_token.iter_mut() {
+                        *value += token as f32 * 0.125;
+                    }
+                    quantize_q8_k(&mut wide[token * blocks..(token + 1) * blocks], &per_token)
+                        .unwrap();
+                }
+                let mut gemm = vec![0.0f32; batch * rows];
+                tensor.tensor_gemm_q8_k(&mut gemm, &wide, batch as u32).unwrap();
+                for &row in &probes {
+                    for token in 0..batch {
+                        let expected = dot_q8_k(
+                            row_of(row),
+                            &wide[token * blocks..(token + 1) * blocks],
+                            blocks,
+                            tensor.ty,
+                        );
+                        assert_eq!(
+                            gemm[token * rows + row].to_bits(),
+                            expected.to_bits(),
+                            "{key} batch={batch} token={token} row={row}"
+                        );
+                    }
+                }
+            }
+            println!("{key}: tile == per-token for batches {batches:?}");
+        }
+        assert!(
+            seen.len() >= 4,
+            "only {} quant types exercised: {seen:?}",
+            seen.len()
+        );
+    }
 }
 
 impl TensorEntry<'_> {
@@ -1006,6 +1183,72 @@ where
             for token in 0..batch {
                 output[token * rows + row] = dot(row, token);
             }
+        }
+    }
+}
+
+/// Row-parallel driver for the fused batched kernel.
+///
+/// Same contract as [`gemm_rows`] — the weight row stays the outer loop, so it
+/// is streamed once and reused for the whole batch — but a row now produces
+/// [`Q38_Q8_K_TILE`] values per fused call instead of one value per token.
+/// The tail (batch % TILE, and 1) falls back to narrower tiles and finally to
+/// the single-token kernel, so the result is independent of the batch size.
+#[allow(clippy::too_many_arguments)]
+fn gemm_rows_tile(
+    output: &mut [f32],
+    rows: usize,
+    batch: usize,
+    rbytes: usize,
+    weights: &[u8],
+    activations: &[Q38Q8KBlock],
+    blocks: usize,
+    per_row: usize,
+    ty: GgmlType,
+) {
+    let targets = RowTargets {
+        base: output.as_mut_ptr(),
+        rows,
+    };
+    let run = |row: usize| {
+        let data = &weights[row * rbytes..(row + 1) * rbytes];
+        let mut values = [0.0f32; Q38_Q8_K_TILE];
+        let mut token = 0usize;
+        while token + Q38_Q8_K_TILE <= batch {
+            let slab = &activations[token * blocks..(token + Q38_Q8_K_TILE) * blocks];
+            dot_q8_k_tile(data, slab, blocks, Q38_Q8_K_TILE, ty, &mut values);
+            for (lane, value) in values.iter().enumerate() {
+                // SAFETY: `row` is owned by this task and `token + lane` is a
+                // distinct column, so every destination is written once.
+                unsafe { targets.at(row, token + lane).write(*value) };
+            }
+            token += Q38_Q8_K_TILE;
+        }
+        let tail = batch - token;
+        if tail >= 2 {
+            let slab = &activations[token * blocks..];
+            dot_q8_k_tile(data, slab, blocks, tail, ty, &mut values);
+            for (lane, value) in values[..tail].iter().enumerate() {
+                unsafe { targets.at(row, token + lane).write(*value) };
+            }
+            token += tail;
+        }
+        while token < batch {
+            let value = dot_q8_k(
+                data,
+                &activations[token * blocks..(token + 1) * blocks],
+                blocks,
+                ty,
+            );
+            unsafe { targets.at(row, token).write(value) };
+            token += 1;
+        }
+    };
+    if q38_parallel_over(rows, per_row) {
+        (0..rows).into_par_iter().for_each(|row| run(row));
+    } else {
+        for row in 0..rows {
+            run(row);
         }
     }
 }
@@ -1267,15 +1510,160 @@ impl Q38TensorOps for TensorEntry<'_> {
             });
             return Ok(());
         }
-        gemm_rows(output, rows, batch, width * batch, |row, token| {
-            let start = token * blocks;
-            dot_q8_k(
-                &weights[row * rbytes..(row + 1) * rbytes],
-                &activations[start..start + blocks],
-                blocks,
-                self.ty,
-            )
-        });
+        gemm_rows_tile(
+            output,
+            rows,
+            batch,
+            rbytes,
+            weights,
+            activations,
+            blocks,
+            width * batch,
+            self.ty,
+        );
         Ok(())
+    }
+}
+
+/// RAM-resident throughput probe for the q8_k dot kernels.
+///
+/// Full-model prefill timing is useless on the development machine (the weights
+/// do not fit in RAM, so every run streams 16 GB from disk and the IO noise
+/// swamps the signal). This probe keeps a synthetic slab in RAM, so the numbers
+/// only reflect the kernel. `Q38_KERNEL_SPEED=1` enables it.
+#[cfg(test)]
+mod speed_probe {
+    use super::*;
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        let mut state = seed | 1;
+        for byte in out.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 33) as u8;
+        }
+        out
+    }
+
+    fn activations(blocks: usize) -> Vec<Q38Q8KBlock> {
+        let mut raw = vec![0f32; blocks * BLOCK];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for value in raw.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *value = ((state >> 40) as i32 as f32) / 1.0e6;
+        }
+        let mut out = (0..blocks)
+            .map(|_| Q38Q8KBlock::default())
+            .collect::<Vec<_>>();
+        crate::kernel::quant::quantize_q8_k(&mut out, &raw).expect("q8_k quantize");
+        out
+    }
+
+    fn best<F: FnMut() -> f32>(rounds: usize, mut run: F) -> f64 {
+        let mut fastest = f64::INFINITY;
+        let mut sink = 0f32;
+        for _ in 0..rounds {
+            let started = Instant::now();
+            sink += run();
+            fastest = fastest.min(started.elapsed().as_secs_f64());
+        }
+        std::hint::black_box(sink);
+        fastest
+    }
+
+    #[test]
+    fn kernel_speed_probe() {
+        if std::env::var("Q38_KERNEL_SPEED").is_err() {
+            eprintln!("Q38_KERNEL_SPEED=1 to run the kernel throughput probe");
+            return;
+        }
+        let blocks = 4096usize;
+        let rows = 600usize;
+        let rounds = 3usize;
+        let per_row_macs = (blocks * BLOCK) as f64;
+        let acts = activations(blocks);
+        let wide = activations(blocks * Q38_Q8_K_TILE);
+
+        // Sweep smaller on purpose: the constant is the maximum, and seeing the
+        // curve is what tells you whether raising it is worth anything.
+        let mut widths = vec![2usize, 4];
+        if Q38_Q8_K_TILE > 4 {
+            widths.push(Q38_Q8_K_TILE);
+        }
+        println!(
+            "threads={} blocks/row={} rows={} weights/row={}",
+            rayon::current_num_threads(),
+            blocks,
+            rows,
+            blocks * BLOCK
+        );
+        print!("{:<8} {:>8} {:>8} {:>7}", "type", "GB/s", "par GF", "ser GF");
+        for lanes in &widths {
+            print!(" {:>16}", format!("lanes{lanes}"));
+        }
+        println!();
+
+        for (name, ty) in [
+            ("Q4_K", GgmlType::Q4K),
+            ("Q5_K", GgmlType::Q5K),
+            ("Q6_K", GgmlType::Q6K),
+            ("IQ4_XS", GgmlType::Iq4Xs),
+        ] {
+            let stride = blocks * ty.block_bytes() as usize;
+            let data = noise(0x9e37_79b9_7f4a_7c15, rows * stride);
+
+            let serial = best(rounds, || {
+                let mut sink = 0f32;
+                for row in 0..rows {
+                    sink += dot_q8_k(&data[row * stride..][..stride], &acts, blocks, ty);
+                }
+                sink
+            });
+            let parallel = best(rounds, || {
+                (0..rows)
+                    .into_par_iter()
+                    .map(|row| dot_q8_k(&data[row * stride..][..stride], &acts, blocks, ty))
+                    .sum()
+            });
+            let macs = (rows as f64) * per_row_macs;
+            let serial_gf = macs * 2.0 / serial / 1e9;
+            let parallel_gf = macs * 2.0 / parallel / 1e9;
+            let bytes = (rows * stride) as f64;
+            print!(
+                "{:<8} {:>8.2} {:>8.1} {:>7.1}",
+                name,
+                bytes / parallel / 1e9,
+                parallel_gf,
+                serial_gf
+            );
+            for &lanes in &widths {
+                let tiled = best(rounds, || {
+                    (0..rows)
+                        .into_par_iter()
+                        .map(|row| {
+                            let mut out = [0f32; Q38_Q8_K_TILE];
+                            dot_q8_k_tile(
+                                &data[row * stride..][..stride],
+                                &wide,
+                                blocks,
+                                lanes,
+                                ty,
+                                &mut out,
+                            );
+                            out[..lanes].iter().sum::<f32>()
+                        })
+                        .sum()
+                });
+                let lanes_gf = macs * 2.0 * lanes as f64 / tiled / 1e9;
+                print!(" {:>9.1} {:>6.2}x", lanes_gf, lanes_gf / parallel_gf);
+            }
+            println!();
+        }
     }
 }

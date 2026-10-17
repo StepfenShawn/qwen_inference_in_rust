@@ -28,7 +28,13 @@ impl fmt::Display for TokenizerError {
 
 impl std::error::Error for TokenizerError {}
 
-pub fn build_tokenizer_from_gguf(gguf: &Gguf) -> Result<Tokenizer, TokenizerError> {
+pub fn build_tokenizer_and_decoder_from_gguf(
+    gguf: &Gguf,
+) -> Result<(Tokenizer, ByteDecoder), TokenizerError> {
+    build_with_decoder(gguf)
+}
+
+fn build_with_decoder(gguf: &Gguf) -> Result<(Tokenizer, ByteDecoder), TokenizerError> {
     // 1. tokens
     let tokens_entry = gguf.find_meta("tokenizer.ggml.tokens").ok_or_else(|| {
         TokenizerError::MissingField("Missing `tokenizer.ggml.tokens` in .gguf file".into())
@@ -82,7 +88,122 @@ pub fn build_tokenizer_from_gguf(gguf: &Gguf) -> Result<Tokenizer, TokenizerErro
         register_special_tokens(&mut tokenizer, &tokens, types)?;
     }
 
-    Ok(tokenizer)
+    // type 3/4（Control / UserDefined）在 decode 时按字面量原样输出，
+    let added: Vec<bool> = match &token_types {
+        Some(types) => (0..tokens.len())
+            .map(|i| matches!(types.get(i), Some(&t) if t == 3 || t == 4))
+            .collect(),
+        None => vec![false; tokens.len()],
+    };
+
+    let decoder = ByteDecoder {
+        tokens,
+        added,
+        cp2byte: build_cp2byte(),
+        pending: Vec::new(),
+    };
+
+    Ok((tokenizer, decoder))
+}
+
+const CP2BYTE_MAX: usize = 512;
+
+fn build_cp2byte() -> [i16; CP2BYTE_MAX] {
+    let mut table = [-1i16; CP2BYTE_MAX];
+    let mut extra: u32 = 0;
+    for byte in 0u32..256 {
+        let direct = (33..=126).contains(&byte)
+            || (161..=172).contains(&byte)
+            || (174..=255).contains(&byte);
+        let cp = if direct {
+            byte
+        } else {
+            let cp = 256 + extra;
+            extra += 1;
+            cp
+        };
+        table[cp as usize] = byte as i16;
+    }
+    debug_assert_eq!(extra, 68, "expected 188 direct-mapped bytes");
+    table
+}
+
+pub struct ByteDecoder {
+    tokens: Vec<String>,
+    added: Vec<bool>,
+    cp2byte: [i16; CP2BYTE_MAX],
+    pending: Vec<u8>,
+}
+
+impl ByteDecoder {
+    pub fn push(&mut self, id: u32) -> String {
+        let idx = id as usize;
+        if idx >= self.tokens.len() {
+            return String::new();
+        }
+
+        if self.added.get(idx).copied().unwrap_or(false) {
+            let mut out = self.take_pending();
+            out.push_str(&self.tokens[idx]);
+            return out;
+        }
+
+        let token = &self.tokens[idx];
+        self.pending.reserve(token.len());
+        for ch in token.chars() {
+            match self.cp2byte.get(ch as usize).copied().unwrap_or(-1) {
+                byte if byte >= 0 => self.pending.push(byte as u8),
+                _ => {
+                    let mut buf = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut buf).as_bytes().to_vec();
+                    self.pending.extend_from_slice(&encoded);
+                }
+            }
+        }
+        self.drain_complete()
+    }
+
+    pub fn finish(&mut self) -> String {
+        self.take_pending()
+    }
+
+    fn take_pending(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn drain_complete(&mut self) -> String {
+        let bytes = std::mem::take(&mut self.pending);
+        let mut out = String::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match std::str::from_utf8(&bytes[i..]) {
+                Ok(text) => {
+                    out.push_str(text);
+                    i = bytes.len();
+                }
+                Err(err) => {
+                    let valid = err.valid_up_to();
+                    if valid > 0 {
+                        out.push_str(std::str::from_utf8(&bytes[i..i + valid]).unwrap());
+                        i += valid;
+                    }
+                    match err.error_len() {
+                        Some(bad) => {
+                            out.push('\u{FFFD}');
+                            i += bad;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending.extend_from_slice(&bytes[i..]);
+        out
+    }
 }
 
 pub fn get_all_control_token_ids(gguf: &Gguf) -> Vec<u32> {

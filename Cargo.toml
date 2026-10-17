@@ -6,8 +6,16 @@ edition = "2024"
 [dependencies]
 ahash = "0.8.12"
 memmap2 = "0.9.11"
+mimalloc = "0.1.52"
 rayon = "1.12"
 tokenizers = "0.23.2"
 
 [features]
 full = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
