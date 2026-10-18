@@ -1,5 +1,5 @@
 # qwen3.8_27b_in_rust
-**Run the Qwen3.8 27B LLM on one laptop CPU at ~3~5 tok/s. Written in pure rust.**
+**Run the Qwen3.8 27B LLM on one laptop CPU at 3~5 tok/s. Written in pure rust.**
 
 No GPU, no BLAS, no ML framework: the quantized GEMM/GEMV kernels, the hybrid linear/full attention,
 the MTP speculative decoder and the sampler are all hand-written, and the whole model is a single
