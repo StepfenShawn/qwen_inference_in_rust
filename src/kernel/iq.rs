@@ -662,7 +662,7 @@ pub(crate) fn dot_iq1_m_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize) -> f
 /// Raw size of one IQ1_S block in the GGUF mapping.
 pub const IQ1S_BLOCK_BYTES: usize = 50;
 
-/// Size of one repacked block; mirrors `Q38IQ1SRepackedBlock`.
+/// Size of one repacked block:
 ///
 /// ```text
 /// +0   float    base_d

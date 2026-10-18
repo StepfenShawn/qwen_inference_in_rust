@@ -410,9 +410,6 @@ unsafe fn apply_iq_signs(activation: __m256i, s0: u32, s1: u32, s2: u32, s3: u32
 }
 
 /// Expand one IQ1_S group quadruple into its 8-byte grid vector.
-///
-/// Mirrors the portable branch of `q38_iq1_s_grid32`: four low index bytes in
-/// `indices`, three high bits each taken from `high`.
 #[target_feature(enable = "avx2")]
 unsafe fn iq1_s_grid32(indices: &[u8], high: u16) -> __m256i {
     let high = high as u32;
