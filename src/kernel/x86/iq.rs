@@ -252,29 +252,29 @@ pub(crate) unsafe fn dot_iq4_xs_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks
     sum_f32x8(accumulated)
 }
 
-/// Fused IQ4_XS: one weight decode, `lanes` activations.
+/// Fused IQ4_XS: one weight decode, `LANES` activations (`LANES` is a const
+/// generic so the lane accumulators stay in registers; see the Q4_K kernel).
 ///
 /// C routes IQ4_XS through `Q38_DEFINE_IQ_TILE`, which just calls the
 /// single-token kernel once per token. IQ4_XS is 29% of this checkpoint's
 /// bytes, so it gets a real fused kernel here instead.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
     let table = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
     let nibble_mask = _mm_set1_epi8(15);
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
     for block in 0..blocks {
         let weights = &data[block * 136..(block + 1) * 136];
         let base_d = f16_at(weights);
         let scale_high = u16_at(&weights[2..]);
         let scale_low = &weights[4..8];
         let quants = &weights[8..136];
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
         for group in 0..8 {
             let scale = ((scale_low[group / 2] >> (4 * (group % 2))) & 15) as i32
                 | (((scale_high >> (2 * group)) & 3) as i32) << 4;
@@ -286,7 +286,7 @@ pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2(
             );
             let quant = _mm256_set_m128i(high, low);
             let scale = _mm256_set1_epi32(scale - 32);
-            for lane in 0..lanes {
+            for lane in 0..LANES {
                 let activation = &q[lane * blocks + block];
                 let values =
                     _mm256_loadu_si256(activation.quants[group * 32..].as_ptr() as *const __m256i);
@@ -295,7 +295,7 @@ pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2(
                     _mm256_add_epi32(weighted[lane], _mm256_mullo_epi32(dot, scale));
             }
         }
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let activation = &q[lane * blocks + block];
             let d = base_d * activation.scale;
             accumulated[lane] = _mm256_fmadd_ps(
@@ -305,7 +305,7 @@ pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2(
             );
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = sum_f32x8(accumulated[lane]);
     }
 }

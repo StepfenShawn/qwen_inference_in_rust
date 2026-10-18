@@ -456,10 +456,10 @@ pub(crate) unsafe fn dot_q8_0_avx2(data: &[u8], input: &[f32], n: usize) -> f32 
 }
 
 // ---------------------------------------------------------------------------
-// Fused tile kernels: one weight decode, `lanes` activations
+// Fused tile kernels: one weight decode, `LANES` activations
 // ---------------------------------------------------------------------------
 
-/// `lanes` dot products of one weight row against `lanes` consecutive Q8_K
+/// `LANES` dot products of one weight row against `LANES` consecutive Q8_K
 /// activation slab (`q[lane * blocks + block]`, token-major).
 ///
 /// Every value that depends only on the weights is computed once per block and
@@ -467,15 +467,14 @@ pub(crate) unsafe fn dot_q8_0_avx2(data: &[u8], input: &[f32], n: usize) -> f32 
 /// single-token kernel, in the same order, so results are bit-exact — the
 /// batched path is a pure scheduling change.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
-    let mut accumulated_min = [_mm_setzero_ps(); Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
+    let mut accumulated_min = [_mm_setzero_ps(); LANES];
     let mask = _mm256_set1_epi8(15);
     for block in 0..blocks {
         let at = block * 144;
@@ -483,7 +482,7 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
         let base_dmin = f16_to_f32(read_u16(&data[at + 2..]));
         let scales = &data[at + 4..at + 16];
         let quants = &data[at + 16..at + 144];
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
         let mut minimum_scales = [0i16; 8];
         for chunk in 0..4 {
             let (scale0, min0) = scale_min_k4(chunk * 2, scales);
@@ -493,7 +492,7 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
             let high = _mm256_and_si256(_mm256_srli_epi16::<4>(packed), mask);
             let scale0 = _mm256_set1_epi16(scale0 as i16);
             let scale1 = _mm256_set1_epi16(scale1 as i16);
-            for lane in 0..lanes {
+            for lane in 0..LANES {
                 let b = &q[lane * blocks + block];
                 let dot0 = _mm256_madd_epi16(
                     _mm256_maddubs_epi16(low, load_quants(b, chunk * 64)),
@@ -512,7 +511,7 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
             minimum_scales[chunk * 2 + 1] = min1 as i16;
         }
         let mins = _mm_loadu_si128(minimum_scales.as_ptr() as *const __m128i);
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let b = &q[lane * blocks + block];
             let d = base_d * b.scale;
             let dmin = base_dmin * b.scale;
@@ -532,7 +531,7 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
             );
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         let mut minimum = _mm_add_ps(
             accumulated_min[lane],
             _mm_movehl_ps(accumulated_min[lane], accumulated_min[lane]),
@@ -541,17 +540,15 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2(
         out[lane] = sum_f32_8(accumulated[lane]) + _mm_cvtss_f32(minimum);
     }
 }
-
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
-    let mut accumulated_min = [_mm_setzero_ps(); Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
+    let mut accumulated_min = [_mm_setzero_ps(); LANES];
     let nibble_mask = _mm256_set1_epi8(15);
     let zero = _mm256_setzero_si256();
     let sixteen = _mm256_set1_epi8(16);
@@ -562,7 +559,7 @@ pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2(
         let scales = &data[at + 4..at + 16];
         let high = &data[at + 16..at + 48];
         let low = &data[at + 48..at + 176];
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
         let mut minimum_scales = [0i16; 8];
         let mut high0: u8 = 1;
         let mut high1: u8 = 2;
@@ -585,7 +582,7 @@ pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2(
             q1 = _mm256_add_epi8(q1, _mm256_andnot_si256(absent1, sixteen));
             let scale0 = _mm256_set1_epi16(scale0 as i16);
             let scale1 = _mm256_set1_epi16(scale1 as i16);
-            for lane in 0..lanes {
+            for lane in 0..LANES {
                 let b = &q[lane * blocks + block];
                 let dot0 = _mm256_madd_epi16(
                     _mm256_maddubs_epi16(q0, load_quants(b, chunk * 64)),
@@ -604,7 +601,7 @@ pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2(
             high1 <<= 2;
         }
         let mins = _mm_loadu_si128(minimum_scales.as_ptr() as *const __m128i);
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let b = &q[lane * blocks + block];
             let sums0 = _mm_loadu_si128(b.sums.as_ptr() as *const __m128i);
             let sums1 = _mm_loadu_si128(b.sums[8..].as_ptr() as *const __m128i);
@@ -626,20 +623,19 @@ pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2(
             );
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = sum_f32_8(accumulated[lane]) + _mm_cvtss_f32(accumulated_min[lane]);
     }
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
     let mask2 = _mm256_set1_epi8(3);
     let mask4 = _mm256_set1_epi8(15);
     for block in 0..blocks {
@@ -648,7 +644,7 @@ pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2(
         let base_d = f16_to_f32(read_u16(&data[at + 208..]));
         let packed_scales = _mm_loadu_si128(scales.as_ptr() as *const __m128i);
         let wide_scales = _mm256_cvtepi8_epi16(packed_scales);
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
         for half in 0..2 {
             let low0 = _mm256_loadu_si256(data[at + half * 64..].as_ptr() as *const __m256i);
             let low1 = _mm256_loadu_si256(data[at + half * 64 + 32..].as_ptr() as *const __m256i);
@@ -675,7 +671,7 @@ pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2(
             let scale1 = q6_scale_pair(scales, si + 2);
             let scale2 = q6_scale_pair(scales, si + 4);
             let scale3 = q6_scale_pair(scales, si + 6);
-            for lane in 0..lanes {
+            for lane in 0..LANES {
                 let b = &q[lane * blocks + block];
                 let p0 = _mm256_madd_epi16(
                     scale0,
@@ -699,7 +695,7 @@ pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2(
                     _mm256_add_epi32(weighted[lane], _mm256_add_epi32(p2, p3));
             }
         }
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let b = &q[lane * blocks + block];
             let input_sums = _mm256_loadu_si256(b.sums.as_ptr() as *const __m256i);
             let offset = _mm256_slli_epi32(_mm256_madd_epi16(input_sums, wide_scales), 5);
@@ -712,20 +708,19 @@ pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2(
             );
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = sum_f32_8(accumulated[lane]);
     }
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
     let mask = _mm256_set1_epi8(3);
     let four = _mm256_set1_epi8(4);
     let zero = _mm256_setzero_si256();
@@ -735,7 +730,7 @@ pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2(
         unpack_q3_scales(&data[at + 96..at + 108], &mut scales);
         let base_d = f16_to_f32(read_u16(&data[at + 108..]));
         let hbits = _mm256_loadu_si256(data[at..at + 32].as_ptr() as *const __m256i);
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
         let mut group = 0usize;
         for half in 0..2 {
             let packed = _mm256_loadu_si256(data[at + 32 + half * 32..].as_ptr() as *const __m256i);
@@ -750,7 +745,7 @@ pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2(
                     _mm_set1_epi32(scales[group * 2 + 1] as i32),
                     _mm_set1_epi32(scales[group * 2] as i32),
                 );
-                for lane in 0..lanes {
+                for lane in 0..LANES {
                     let b = &q[lane * blocks + block];
                     let values = load_quants(b, half * 128 + field * 32);
                     let dot = products_s8_s8_32(quant, values);
@@ -760,7 +755,7 @@ pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2(
                 group += 1;
             }
         }
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let b = &q[lane * blocks + block];
             let d = base_d * b.scale;
             accumulated[lane] = _mm256_fmadd_ps(
@@ -770,21 +765,20 @@ pub(crate) unsafe fn dot_q3_k_q8_k_tile_avx2(
             );
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = sum_f32_8(accumulated[lane]);
     }
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2(
+pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2<const LANES: usize>(
     data: &[u8],
     q: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    let mut accumulated = [_mm256_setzero_ps(); Q38_Q8_K_TILE];
-    let mut accumulated_min = [0.0f32; Q38_Q8_K_TILE];
+    let mut accumulated = [_mm256_setzero_ps(); LANES];
+    let mut accumulated_min = [0.0f32; LANES];
     let mask = _mm256_set1_epi8(3);
     for block in 0..blocks {
         let at = block * 84;
@@ -792,8 +786,8 @@ pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2(
         let quants = &data[at + 16..at + 80];
         let base_d = f16_to_f32(read_u16(&data[at + 80..]));
         let base_dmin = f16_to_f32(read_u16(&data[at + 82..]));
-        let mut weighted = [_mm256_setzero_si256(); Q38_Q8_K_TILE];
-        let mut minimum = [0i32; Q38_Q8_K_TILE];
+        let mut weighted = [_mm256_setzero_si256(); LANES];
+        let mut minimum = [0i32; LANES];
         for half in 0..2 {
             let packed = _mm256_loadu_si256(quants[half * 32..].as_ptr() as *const __m256i);
             for field in 0..4 {
@@ -802,7 +796,7 @@ pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2(
                 let scale1 = (scales[scale_index + 1] & 15) as i32;
                 let quant = _mm256_and_si256(q2_field_shift(packed, field), mask);
                 let scale = _mm256_set_m128i(_mm_set1_epi32(scale1), _mm_set1_epi32(scale0));
-                for lane in 0..lanes {
+                for lane in 0..LANES {
                     let b = &q[lane * blocks + block];
                     let activation = load_quants(b, half * 128 + field * 32);
                     let dot = products_u8_s8_32(quant, activation);
@@ -813,7 +807,7 @@ pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2(
                 }
             }
         }
-        for lane in 0..lanes {
+        for lane in 0..LANES {
             let b = &q[lane * blocks + block];
             let d = base_d * b.scale;
             let dmin = base_dmin * b.scale;
@@ -825,7 +819,7 @@ pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2(
             accumulated_min[lane] = (-dmin).mul_add(minimum[lane] as f32, accumulated_min[lane]);
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = sum_f32_8(accumulated[lane]) + accumulated_min[lane];
     }
 }
@@ -996,9 +990,15 @@ mod tests {
             quantize_q8_k(&mut wide[token * blocks..(token + 1) * blocks], &per_token).unwrap();
         }
 
-        for lanes in 2..=Q38_Q8_K_TILE {
-            let mut out = [0.0f32; Q38_Q8_K_TILE];
-            unsafe { dot_q2_k_q8_k_tile_avx2(&data, &wide, blocks, lanes, &mut out) };
+        // Wide path (batch is a multiple of the tile) and a narrower tail width
+        // — the two lane counts `gemm_rows_tile` actually instantiates.
+        let mut wide_out = [0.0f32; Q38_Q8_K_TILE];
+        let mut tail_out = [0.0f32; Q38_Q8_K_TILE];
+        unsafe {
+            dot_q2_k_q8_k_tile_avx2::<Q38_Q8_K_TILE>(&data, &wide, blocks, &mut wide_out);
+            dot_q2_k_q8_k_tile_avx2::<3>(&data, &wide, blocks, &mut tail_out);
+        }
+        for (lanes, out) in [(Q38_Q8_K_TILE, &wide_out), (3, &tail_out)] {
             for lane in 0..lanes {
                 let single = unsafe {
                     dot_q2_k_q8_k_avx2(

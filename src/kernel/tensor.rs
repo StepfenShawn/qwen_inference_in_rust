@@ -560,84 +560,77 @@ fn dot_q8_k(data: &[u8], q: &[Q38Q8KBlock], blocks: usize, ty: GgmlType) -> f32 
     }
 }
 
-/// Fused counterpart of [`dot_q8_k`]: the same weight row against `lanes`
+/// Fused counterpart of [`dot_q8_k`]: the same weight row against `LANES`
 /// consecutive token slabs, laid out token-major
 /// (`activations[lane * blocks + block]`).
-fn dot_q8_k_tile(
+fn dot_q8_k_tile<const LANES: usize>(
     data: &[u8],
     activations: &[Q38Q8KBlock],
     blocks: usize,
-    lanes: usize,
     ty: GgmlType,
     out: &mut [f32; Q38_Q8_K_TILE],
 ) {
-    debug_assert!(lanes > 0 && lanes <= Q38_Q8_K_TILE);
-    debug_assert!(activations.len() >= lanes * blocks && blocks > 0);
+    debug_assert!(LANES > 0 && LANES <= Q38_Q8_K_TILE);
+    debug_assert!(activations.len() >= LANES * blocks && blocks > 0);
     #[cfg(target_arch = "x86_64")]
     if tile_kernels_available() {
         match ty {
             GgmlType::Q2K => {
                 return unsafe {
-                    crate::kernel::x86::tensor::dot_q2_k_q8_k_tile_avx2(
+                    crate::kernel::x86::tensor::dot_q2_k_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
             }
             GgmlType::Q3K => {
                 return unsafe {
-                    crate::kernel::x86::tensor::dot_q3_k_q8_k_tile_avx2(
+                    crate::kernel::x86::tensor::dot_q3_k_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
             }
             GgmlType::Q4K => {
                 return unsafe {
-                    crate::kernel::x86::tensor::dot_q4_k_q8_k_tile_avx2(
+                    crate::kernel::x86::tensor::dot_q4_k_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
             }
             GgmlType::Q5K => {
                 return unsafe {
-                    crate::kernel::x86::tensor::dot_q5_k_q8_k_tile_avx2(
+                    crate::kernel::x86::tensor::dot_q5_k_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
             }
             GgmlType::Q6K => {
                 return unsafe {
-                    crate::kernel::x86::tensor::dot_q6_k_q8_k_tile_avx2(
+                    crate::kernel::x86::tensor::dot_q6_k_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
             }
             GgmlType::Iq4Xs => {
                 return unsafe {
-                    crate::kernel::x86::iq::dot_iq4_xs_q8_k_tile_avx2(
+                    crate::kernel::x86::iq::dot_iq4_xs_q8_k_tile_avx2::<LANES>(
                         data,
                         activations,
                         blocks,
-                        lanes,
                         out,
                     )
                 };
@@ -645,13 +638,40 @@ fn dot_q8_k_tile(
             _ => {}
         }
     }
-    for lane in 0..lanes {
+    for lane in 0..LANES {
         out[lane] = dot_q8_k(
             data,
             &activations[lane * blocks..(lane + 1) * blocks],
             blocks,
             ty,
         );
+    }
+}
+
+/// Tail entry point: the batch remainder (`batch % Q38_Q8_K_TILE`) is only
+/// known at run time, so the lane count is dispatched here onto the const
+/// monomorphisations instead of decoding the weights token by token.
+fn dot_q8_k_tile_tail(
+    data: &[u8],
+    activations: &[Q38Q8KBlock],
+    blocks: usize,
+    lanes: usize,
+    ty: GgmlType,
+    out: &mut [f32; Q38_Q8_K_TILE],
+) {
+    match lanes {
+        2 => dot_q8_k_tile::<2>(data, activations, blocks, ty, out),
+        3 => dot_q8_k_tile::<3>(data, activations, blocks, ty, out),
+        _ => {
+            for lane in 0..lanes {
+                out[lane] = dot_q8_k(
+                    data,
+                    &activations[lane * blocks..(lane + 1) * blocks],
+                    blocks,
+                    ty,
+                );
+            }
+        }
     }
 }
 
@@ -1216,7 +1236,7 @@ fn gemm_rows_tile(
         let mut token = 0usize;
         while token + Q38_Q8_K_TILE <= batch {
             let slab = &activations[token * blocks..(token + Q38_Q8_K_TILE) * blocks];
-            dot_q8_k_tile(data, slab, blocks, Q38_Q8_K_TILE, ty, &mut values);
+            dot_q8_k_tile::<Q38_Q8_K_TILE>(data, slab, blocks, ty, &mut values);
             for (lane, value) in values.iter().enumerate() {
                 // SAFETY: `row` is owned by this task and `token + lane` is a
                 // distinct column, so every destination is written once.
@@ -1227,7 +1247,7 @@ fn gemm_rows_tile(
         let tail = batch - token;
         if tail >= 2 {
             let slab = &activations[token * blocks..];
-            dot_q8_k_tile(data, slab, blocks, tail, ty, &mut values);
+            dot_q8_k_tile_tail(data, slab, blocks, tail, ty, &mut values);
             for (lane, value) in values[..tail].iter().enumerate() {
                 unsafe { targets.at(row, token + lane).write(*value) };
             }
@@ -1590,24 +1610,18 @@ mod speed_probe {
         let acts = activations(blocks);
         let wide = activations(blocks * Q38_Q8_K_TILE);
 
-        // Sweep smaller on purpose: the constant is the maximum, and seeing the
-        // curve is what tells you whether raising it is worth anything.
-        let mut widths = vec![2usize, 4];
-        if Q38_Q8_K_TILE > 4 {
-            widths.push(Q38_Q8_K_TILE);
-        }
         println!(
-            "threads={} blocks/row={} rows={} weights/row={}",
+            "threads={} blocks/row={} rows={} weights/row={} tile={}",
             rayon::current_num_threads(),
             blocks,
             rows,
-            blocks * BLOCK
+            blocks * BLOCK,
+            Q38_Q8_K_TILE
         );
-        print!("{:<8} {:>8} {:>8} {:>7}", "type", "GB/s", "par GF", "ser GF");
-        for lanes in &widths {
-            print!(" {:>16}", format!("lanes{lanes}"));
-        }
-        println!();
+        println!(
+            "{:<8} {:>8} {:>8} {:>7} {:>9} {:>7}",
+            "type", "GB/s", "par GF", "ser GF", "tile GF", "vs par"
+        );
 
         for (name, ty) in [
             ("Q4_K", GgmlType::Q4K),
@@ -1642,28 +1656,24 @@ mod speed_probe {
                 parallel_gf,
                 serial_gf
             );
-            for &lanes in &widths {
-                let tiled = best(rounds, || {
-                    (0..rows)
-                        .into_par_iter()
-                        .map(|row| {
-                            let mut out = [0f32; Q38_Q8_K_TILE];
-                            dot_q8_k_tile(
-                                &data[row * stride..][..stride],
-                                &wide,
-                                blocks,
-                                lanes,
-                                ty,
-                                &mut out,
-                            );
-                            out[..lanes].iter().sum::<f32>()
-                        })
-                        .sum()
-                });
-                let lanes_gf = macs * 2.0 * lanes as f64 / tiled / 1e9;
-                print!(" {:>9.1} {:>6.2}x", lanes_gf, lanes_gf / parallel_gf);
-            }
-            println!();
+            let tiled = best(rounds, || {
+                (0..rows)
+                    .into_par_iter()
+                    .map(|row| {
+                        let mut out = [0f32; Q38_Q8_K_TILE];
+                        dot_q8_k_tile::<Q38_Q8_K_TILE>(
+                            &data[row * stride..][..stride],
+                            &wide,
+                            blocks,
+                            ty,
+                            &mut out,
+                        );
+                        out.iter().sum::<f32>()
+                    })
+                    .sum()
+            });
+            let tiled_gf = macs * 2.0 * Q38_Q8_K_TILE as f64 / tiled / 1e9;
+            println!(" {:>9.1} {:>6.2}x", tiled_gf, tiled_gf / parallel_gf);
         }
     }
 }
