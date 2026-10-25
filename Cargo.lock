@@ -507,6 +507,7 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "rayon",
+ "serde_json",
  "tokenizers",
 ]
 

@@ -36,8 +36,7 @@ const BLOCK: usize = Q38_Q8_K_BLOCK_SIZE;
 /// One recurrent ("linear attention") layer keeps two pieces of state: the
 /// short convolution window and the DeltaNet per-head matrix.
 const CONV_LAYER_STATE: usize = Q38_LINEAR_QKV_DIM * 3;
-const DELTA_LAYER_STATE: usize =
-    Q38_LINEAR_V_HEADS * Q38_LINEAR_HEAD_DIM * Q38_LINEAR_HEAD_DIM;
+const DELTA_LAYER_STATE: usize = Q38_LINEAR_V_HEADS * Q38_LINEAR_HEAD_DIM * Q38_LINEAR_HEAD_DIM;
 const CONV_STATE_LEN: usize = Q38_RECURRENT_LAYERS * CONV_LAYER_STATE;
 const DELTA_STATE_LEN: usize = Q38_RECURRENT_LAYERS * DELTA_LAYER_STATE;
 
@@ -1728,9 +1727,8 @@ impl<'a> Q38Model<'a> {
         let delta_at = slot * DELTA_STATE_LEN;
         self.conv_state
             .copy_from_slice(&self.rollback_conv_state[conv_at..conv_at + CONV_STATE_LEN]);
-        self.delta_state.copy_from_slice(
-            &self.rollback_delta_state[delta_at..delta_at + DELTA_STATE_LEN],
-        );
+        self.delta_state
+            .copy_from_slice(&self.rollback_delta_state[delta_at..delta_at + DELTA_STATE_LEN]);
         self.position = self.checkpoint_position + steps as u32;
     }
 

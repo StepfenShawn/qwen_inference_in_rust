@@ -136,6 +136,12 @@ pub struct ByteDecoder {
 }
 
 impl ByteDecoder {
+    /// Drop any half-decoded bytes left over from a previous stream, so one
+    /// decoder can serve many independent requests (a server, for instance).
+    pub fn reset(&mut self) {
+        self.pending.clear();
+    }
+
     pub fn push(&mut self, id: u32) -> String {
         let idx = id as usize;
         if idx >= self.tokens.len() {

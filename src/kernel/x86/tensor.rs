@@ -2,8 +2,8 @@
 
 //! AVX2 tensor kernels.
 
-use crate::kernel::Q38Q8KBlock;
 use crate::kernel::Q38_Q8_K_TILE;
+use crate::kernel::Q38Q8KBlock;
 use crate::kernel::quant::f16_to_f32;
 use crate::kernel::tensor::{read_f32, read_u16, scale_min_k4, unpack_q3_scales};
 use std::arch::x86_64::*;
@@ -279,13 +279,11 @@ pub(crate) unsafe fn dot_q2_k_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks: 
                 // matches the 16-element split of the scalar reference.
                 let quant = _mm256_and_si256(q2_field_shift(packed, field), mask);
                 let activation = _mm256_loadu_si256(
-                    b.quants[half * 128 + field * 32..].as_ptr() as *const __m256i,
+                    b.quants[half * 128 + field * 32..].as_ptr() as *const __m256i
                 );
                 let dot = products_u8_s8_32(quant, activation);
-                let scale =
-                    _mm256_set_m128i(_mm_set1_epi32(scale1), _mm_set1_epi32(scale0));
-                weighted_lanes =
-                    _mm256_add_epi32(weighted_lanes, _mm256_mullo_epi32(dot, scale));
+                let scale = _mm256_set_m128i(_mm_set1_epi32(scale1), _mm_set1_epi32(scale0));
+                weighted_lanes = _mm256_add_epi32(weighted_lanes, _mm256_mullo_epi32(dot, scale));
                 minimum += (scales[scale_index] >> 4) as i32 * b.sums[scale_index] as i32;
                 minimum += (scales[scale_index + 1] >> 4) as i32 * b.sums[scale_index + 1] as i32;
             }
@@ -502,10 +500,7 @@ pub(crate) unsafe fn dot_q4_k_q8_k_tile_avx2<const LANES: usize>(
                     _mm256_maddubs_epi16(high, load_quants(b, chunk * 64 + 32)),
                     scale1,
                 );
-                weighted[lane] = _mm256_add_epi32(
-                    weighted[lane],
-                    _mm256_add_epi32(dot0, dot1),
-                );
+                weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_add_epi32(dot0, dot1));
             }
             minimum_scales[chunk * 2] = min0 as i16;
             minimum_scales[chunk * 2 + 1] = min1 as i16;
@@ -584,16 +579,13 @@ pub(crate) unsafe fn dot_q5_k_q8_k_tile_avx2<const LANES: usize>(
             let scale1 = _mm256_set1_epi16(scale1 as i16);
             for lane in 0..LANES {
                 let b = &q[lane * blocks + block];
-                let dot0 = _mm256_madd_epi16(
-                    _mm256_maddubs_epi16(q0, load_quants(b, chunk * 64)),
-                    scale0,
-                );
+                let dot0 =
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(q0, load_quants(b, chunk * 64)), scale0);
                 let dot1 = _mm256_madd_epi16(
                     _mm256_maddubs_epi16(q1, load_quants(b, chunk * 64 + 32)),
                     scale1,
                 );
-                weighted[lane] =
-                    _mm256_add_epi32(weighted[lane], _mm256_add_epi32(dot0, dot1));
+                weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_add_epi32(dot0, dot1));
             }
             minimum_scales[chunk * 2] = min0 as i16;
             minimum_scales[chunk * 2 + 1] = min1 as i16;
@@ -673,26 +665,15 @@ pub(crate) unsafe fn dot_q6_k_q8_k_tile_avx2<const LANES: usize>(
             let scale3 = q6_scale_pair(scales, si + 6);
             for lane in 0..LANES {
                 let b = &q[lane * blocks + block];
-                let p0 = _mm256_madd_epi16(
-                    scale0,
-                    _mm256_maddubs_epi16(q0, load_quants(b, base)),
-                );
-                let p1 = _mm256_madd_epi16(
-                    scale1,
-                    _mm256_maddubs_epi16(q1, load_quants(b, base + 32)),
-                );
-                let p2 = _mm256_madd_epi16(
-                    scale2,
-                    _mm256_maddubs_epi16(q2, load_quants(b, base + 64)),
-                );
-                let p3 = _mm256_madd_epi16(
-                    scale3,
-                    _mm256_maddubs_epi16(q3, load_quants(b, base + 96)),
-                );
-                weighted[lane] =
-                    _mm256_add_epi32(weighted[lane], _mm256_add_epi32(p0, p1));
-                weighted[lane] =
-                    _mm256_add_epi32(weighted[lane], _mm256_add_epi32(p2, p3));
+                let p0 = _mm256_madd_epi16(scale0, _mm256_maddubs_epi16(q0, load_quants(b, base)));
+                let p1 =
+                    _mm256_madd_epi16(scale1, _mm256_maddubs_epi16(q1, load_quants(b, base + 32)));
+                let p2 =
+                    _mm256_madd_epi16(scale2, _mm256_maddubs_epi16(q2, load_quants(b, base + 64)));
+                let p3 =
+                    _mm256_madd_epi16(scale3, _mm256_maddubs_epi16(q3, load_quants(b, base + 96)));
+                weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_add_epi32(p0, p1));
+                weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_add_epi32(p2, p3));
             }
         }
         for lane in 0..LANES {
@@ -800,7 +781,8 @@ pub(crate) unsafe fn dot_q2_k_q8_k_tile_avx2<const LANES: usize>(
                     let b = &q[lane * blocks + block];
                     let activation = load_quants(b, half * 128 + field * 32);
                     let dot = products_u8_s8_32(quant, activation);
-                    weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_mullo_epi32(dot, scale));
+                    weighted[lane] =
+                        _mm256_add_epi32(weighted[lane], _mm256_mullo_epi32(dot, scale));
                     minimum[lane] += (scales[scale_index] >> 4) as i32 * b.sums[scale_index] as i32;
                     minimum[lane] +=
                         (scales[scale_index + 1] >> 4) as i32 * b.sums[scale_index + 1] as i32;
@@ -1001,11 +983,7 @@ mod tests {
         for (lanes, out) in [(Q38_Q8_K_TILE, &wide_out), (3, &tail_out)] {
             for lane in 0..lanes {
                 let single = unsafe {
-                    dot_q2_k_q8_k_avx2(
-                        &data,
-                        &wide[lane * blocks..(lane + 1) * blocks],
-                        blocks,
-                    )
+                    dot_q2_k_q8_k_avx2(&data, &wide[lane * blocks..(lane + 1) * blocks], blocks)
                 };
                 assert_eq!(
                     out[lane].to_bits(),

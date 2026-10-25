@@ -1,20 +1,20 @@
 mod gguf;
 mod kernel;
 mod model;
+// The CLI only renders prompts; `ToolParser` belongs to the HTTP server.
+#[allow(dead_code)]
+mod prompt;
 mod tokenizer;
 
 use gguf::Gguf;
 use kernel::Q38Iq1sRepack;
 use model::{Q38Model, Q38ModelOps};
+use prompt::Effort;
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::sampler::Sampler;
-
-const EFFORT_LOW: i32 = 0;
-const EFFORT_MEDIUM: i32 = 1;
-const EFFORT_XHIGH: i32 = 2;
 
 struct Options {
     model: Option<String>,
@@ -28,7 +28,7 @@ struct Options {
     top_p: f32,
     presence_penalty: f32,
     thinking: bool,
-    reasoning_effort: i32,
+    reasoning_effort: Effort,
     mtp_draft: u32,
     threads: Option<usize>,
 }
@@ -51,7 +51,7 @@ impl Default for Options {
             top_p: 0.95,
             presence_penalty: 0.0,
             thinking: true,
-            reasoning_effort: EFFORT_XHIGH,
+            reasoning_effort: Effort::Xhigh,
             mtp_draft: 0,
             threads: None,
         }
@@ -131,18 +131,14 @@ fn parse_args() -> Result<Options, String> {
             }
             "--reasoning-effort" => {
                 let effort = next("--reasoning-effort")?;
-                opts.reasoning_effort = match effort.as_str() {
-                    "low" => EFFORT_LOW,
-                    "medium" => EFFORT_MEDIUM,
-                    "xhigh" => EFFORT_XHIGH,
-                    _ => return Err("invalid --reasoning-effort".to_string()),
-                };
-            },
+                opts.reasoning_effort =
+                    Effort::parse(&effort).ok_or("invalid --reasoning-effort")?;
+            }
             "--mtp-draft" => {
                 opts.mtp_draft = next("--mtp-draft")?
                     .parse()
                     .map_err(|_| "invalid --mtp-draft".to_string())?;
-            },
+            }
             "--no-thinking" => opts.thinking = false,
             "--threads" => {
                 let threads: usize = next("--threads")?
@@ -171,41 +167,6 @@ fn parse_args() -> Result<Options, String> {
         return Err("--prompt is required".to_string());
     }
     Ok(opts)
-}
-
-fn render_prompt(user: &str, system: Option<&str>, thinking: bool, effort: i32) -> String {
-    const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
-    const LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
-
-    let instruction = if thinking && effort == EFFORT_XHIGH {
-        XHIGH
-    } else if thinking && effort == EFFORT_LOW {
-        LOW
-    } else {
-        ""
-    };
-    let system_text = system.unwrap_or("");
-    let add_system = !instruction.is_empty() || !system_text.is_empty();
-
-    let mut prompt = String::new();
-    if add_system {
-        prompt.push_str("<|im_start|>system\n");
-        prompt.push_str(instruction);
-        if !instruction.is_empty() && !system_text.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(system_text);
-        prompt.push_str("<|im_end|>\n");
-    }
-    prompt.push_str("<|im_start|>user\n");
-    prompt.push_str(user);
-    prompt.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    prompt.push_str(if thinking {
-        "<think>\n"
-    } else {
-        "<think>\n\n</think>\n\n"
-    });
-    prompt
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -238,13 +199,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Q38Model::open_gguf(&gguf, options.context).map_err(|_| "unable to open model")?;
 
     if options.mtp_draft > 0 {
-        model.enable_mtp().map_err(|_| {
-            "MTP head unavailable: checkpoint must carry blk.64.nextn.*"
-        })?;
-        eprintln!("qwen38: MTP speculative decoding on (draft={})", options.mtp_draft);
+        model
+            .enable_mtp()
+            .map_err(|_| "MTP head unavailable: checkpoint must carry blk.64.nextn.*")?;
+        eprintln!(
+            "qwen38: MTP speculative decoding on (draft={})",
+            options.mtp_draft
+        );
     }
 
-    let prompt = render_prompt(
+    let prompt = prompt::render_simple(
         options.prompt.as_deref().unwrap(),
         options.system.as_deref(),
         options.thinking,
@@ -327,19 +291,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             break;
         }
-    
+
         if options.mtp_draft == 0 {
             let logits = model.forward_token(pending).map_err(|_| "forward failed")?;
             pending = sampler.sample(logits);
             continue;
         }
-    
+
         // draft 必须 <= 剩余 context（内核会校验）且 <= 剩余预算
-        let draft = options.mtp_draft.min(options.max_tokens - generated).min(room);
+        let draft = options
+            .mtp_draft
+            .min(options.max_tokens - generated)
+            .min(room);
         let (_, consumed) = model
             .speculative_greedy(pending, eos, draft, &mut accepted[..draft as usize])
             .map_err(|_| "speculative decode failed")?;
-    
+
         // `accepted` 里最后一个 token 还没有送进 target，下一轮它才会作为
         // `pending` 被输出；所以本轮只打印前 n-1 个，否则它会被打两遍。
         let n = consumed as usize;

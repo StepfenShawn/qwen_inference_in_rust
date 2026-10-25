@@ -1,4 +1,4 @@
-﻿#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::gguf::{GgmlType, TensorEntry};
 use crate::kernel::iq;
@@ -1105,7 +1105,9 @@ mod tests {
                         .unwrap();
                 }
                 let mut gemm = vec![0.0f32; batch * rows];
-                tensor.tensor_gemm_q8_k(&mut gemm, &wide, batch as u32).unwrap();
+                tensor
+                    .tensor_gemm_q8_k(&mut gemm, &wide, batch as u32)
+                    .unwrap();
                 for &row in &probes {
                     for token in 0..batch {
                         let expected = dot_q8_k(

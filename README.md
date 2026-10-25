@@ -1,5 +1,5 @@
 # qwen3.8_27b_in_rust
-**Runs the Qwen3.8 27B LLM on a single CPU with >=8GB of RAM, delivering up to ~7 tok/s. Written in pure Rust.**
+**Runs the Qwen3.8 27B LLM on a single CPU with >=8GB of RAM, delivering up to ~7.4 tok/s. Written in pure Rust.**
 ![Qwen3.8 arch](docs/images/qwen38_architecture.png)
 No GPU, no BLAS, no ML framework: the quantized GEMM/GEMV kernels, the hybrid linear/full attention,
 the MTP speculative decoder and the sampler are all hand-written, and the whole model is a single
@@ -34,8 +34,16 @@ qwen38_27b_in_rust --model MODEL.gguf [--prompt TEXT] [options]
 ```
 example:  
 ```
-> ./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello --max-tokens 256 --context 256 --no-thinking
-Hello! How can I help you today?
+> ./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello
+<think>
+Hmm, the user just said "Hello". This is a very brief greeting. They didn't ask a question or provide any context, so I should respond with a friendly greeting and an open invitation for them to continue the conversation.
+</think>
+
+Hello there! How can I help you today? 😊
+[prompt=53 tokens, output=61 tokens, threads=24, elapsed=28.121s
+ TTFT=5.143s
+ TPOT=0.278s
+]
 ```
 speculative decoding(speedup ~1.8×):  
 ```
@@ -43,12 +51,26 @@ speculative decoding(speedup ~1.8×):
   --max-tokens 256 --context 1024 --temperature 0 --mtp-draft 3
 ```
 
+# HTTP server
+`qwen_inference_server` is a second binary in the same crate that serves the engine over an
+OpenAI-compatible HTTP API. It is hand-written on `std::net::TcpListener` — no async runtime,
+no web framework — and the only added dependency is `serde_json`, which `tokenizers` already
+pulls in.
+
+```
+./qwen_inference_server --model Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080
+  --context N     context capacity (default: 4096)
+  --threads N     worker threads for the kernels
+  --mtp-draft N   greedy speculative decoding, temperature 0 only (0 = off)
+  --host ADDR     bind address (default: 127.0.0.1)
+```
+
 # Build
 Fetch the source:
 
 ```
-git clone https://github.com/StepfenShawn/qwen3.8_27b_in_rust.git
-cd qwen3.8_27b_in_rust
+git clone https://github.com/StepfenShawn/qwen_inference_in_rust.git
+cd qwen_inference_in_rust
 ```
 
 ```

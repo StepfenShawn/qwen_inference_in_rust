@@ -8,6 +8,7 @@ ahash = "0.8.12"
 memmap2 = "0.9.11"
 mimalloc = "0.1.52"
 rayon = "1.12"
+serde_json = "1.0"
 tokenizers = "0.23.2"
 
 [features]

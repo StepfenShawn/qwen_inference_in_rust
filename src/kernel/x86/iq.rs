@@ -2,8 +2,8 @@
 
 //! AVX2 IQ kernels.
 
-use crate::kernel::Q38Q8KBlock;
 use crate::kernel::Q38_Q8_K_TILE;
+use crate::kernel::Q38Q8KBlock;
 use crate::kernel::iq::{
     IQ1_DELTA, IQ1S_REPACK_BLOCK_BYTES, f16_at, iq4_nl_group, repack_base_d, repack_grid_index,
     repack_signed_scale, u16_at, u32_at,
@@ -291,8 +291,7 @@ pub(crate) unsafe fn dot_iq4_xs_q8_k_tile_avx2<const LANES: usize>(
                 let values =
                     _mm256_loadu_si256(activation.quants[group * 32..].as_ptr() as *const __m256i);
                 let dot = products_s8_s8_32(quant, values);
-                weighted[lane] =
-                    _mm256_add_epi32(weighted[lane], _mm256_mullo_epi32(dot, scale));
+                weighted[lane] = _mm256_add_epi32(weighted[lane], _mm256_mullo_epi32(dot, scale));
             }
         }
         for lane in 0..LANES {
@@ -450,7 +449,7 @@ pub(crate) unsafe fn dot_iq1_s_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks:
             let activation0 =
                 _mm256_loadu_si256(activation.quants[group * 32..].as_ptr() as *const __m256i);
             let activation1 = _mm256_loadu_si256(
-                activation.quants[(group + 1) * 32..].as_ptr() as *const __m256i,
+                activation.quants[(group + 1) * 32..].as_ptr() as *const __m256i
             );
             let scale0 = 1 + 2 * ((high0 >> 12) & 7) as i32;
             let scale1 = 1 + 2 * ((high1 >> 12) & 7) as i32;
@@ -532,7 +531,7 @@ pub(crate) unsafe fn dot_iq1_m_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks:
             let activation0 =
                 _mm256_loadu_si256(activation.quants[group * 32..].as_ptr() as *const __m256i);
             let activation1 = _mm256_loadu_si256(
-                activation.quants[(group + 1) * 32..].as_ptr() as *const __m256i,
+                activation.quants[(group + 1) * 32..].as_ptr() as *const __m256i
             );
             let scales = u16_at(&packed_scales[(group / 2) * 2..]);
             let scale0 = 1 + 2 * ((scales >> 0) & 7) as i32;
@@ -682,8 +681,7 @@ pub(crate) unsafe fn dot_iq2_s_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], blocks:
         // lane and `scale1` in the high one, which is what the shuffle below
         // broadcasts per section pair.
         let packed_scales = u64::from_le_bytes(scales.try_into().unwrap());
-        let mut scale_bytes =
-            _mm_set_epi64x((packed_scales >> 4) as i64, packed_scales as i64);
+        let mut scale_bytes = _mm_set_epi64x((packed_scales >> 4) as i64, packed_scales as i64);
         scale_bytes = _mm_add_epi8(
             _mm_slli_epi16::<1>(_mm_and_si128(scale_bytes, scale_mask)),
             scale_one,
@@ -770,15 +768,15 @@ pub(crate) unsafe fn dot_iq3_xxs_q8_k_avx2(data: &[u8], q: &[Q38Q8KBlock], block
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::Q38_Q8_K_BLOCK_SIZE;
     use crate::gguf::{GgmlType, Gguf};
+    use crate::kernel::Q38_Q8_K_BLOCK_SIZE;
     use crate::kernel::iq::{
-        dot_iq1_m_q8_k, dot_iq1_s_q8_k, dot_iq2_s_q8_k, dot_iq2_xxs_q8_k, dot_iq2_xs_q8_k,
+        dot_iq1_m_q8_k, dot_iq1_s_q8_k, dot_iq2_s_q8_k, dot_iq2_xs_q8_k, dot_iq2_xxs_q8_k,
         dot_iq3_s_q8_k, dot_iq3_xxs_q8_k, dot_iq4_nl_q8_k, dot_iq4_xs_q8_k,
     };
+    use crate::kernel::quant::quantize_q8_k;
     use crate::kernel::tensor::{dot_q2_k_q8_k_scalar, row_bytes};
     use crate::kernel::x86::tensor::dot_q2_k_q8_k_avx2;
-    use crate::kernel::quant::quantize_q8_k;
 
     struct Rng(u32);
 
@@ -917,11 +915,9 @@ mod tests {
             );
 
             let iq3 = synthetic_blocks(blocks, 110, seed);
-            check(
-                "IQ3_S",
-                dot_iq3_s_q8_k(&iq3, &activation, blocks),
-                unsafe { dot_iq3_s_q8_k_avx2(&iq3, &activation, blocks) },
-            );
+            check("IQ3_S", dot_iq3_s_q8_k(&iq3, &activation, blocks), unsafe {
+                dot_iq3_s_q8_k_avx2(&iq3, &activation, blocks)
+            });
 
             let iq1s = synthetic_blocks(blocks, 50, seed);
             check(

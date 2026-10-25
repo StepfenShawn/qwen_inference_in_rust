@@ -3,6 +3,7 @@
 // Lookup tables shared by the IQ (importance quantization) kernels. They are
 // extracted verbatim from ggml's `ggml-common.h` (MIT licensed)
 #![allow(clippy::all)]
+#![cfg_attr(rustfmt, rustfmt_skip)]
 
 /// `kmask_iq2xs` from ggml-common.h (8 entries).
 pub const KMASK_IQ2XS: [u8; 8] = [
