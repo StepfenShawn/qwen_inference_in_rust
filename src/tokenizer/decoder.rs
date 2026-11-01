@@ -1,12 +1,14 @@
 const CP2BYTE_MAX: usize = 512;
 
-fn build_cp2byte() -> [i16; CP2BYTE_MAX] {
+const fn build_cp2byte() -> [i16; CP2BYTE_MAX] {
     let mut table = [-1i16; CP2BYTE_MAX];
     let mut extra: u32 = 0;
-    for byte in 0u32..256 {
-        let direct = (33..=126).contains(&byte)
-            || (161..=172).contains(&byte)
-            || (174..=255).contains(&byte);
+    let mut byte: u32 = 0;
+
+    while byte < 256 {
+        let direct = (byte >= 33 && byte <= 126)
+            || (byte >= 161 && byte <= 172)
+            || (byte >= 174 && byte <= 255);
         let cp = if direct {
             byte
         } else {
@@ -15,10 +17,13 @@ fn build_cp2byte() -> [i16; CP2BYTE_MAX] {
             cp
         };
         table[cp as usize] = byte as i16;
+        byte += 1;
     }
-    debug_assert_eq!(extra, 68, "expected 188 direct-mapped bytes");
+    debug_assert!(extra == 68, "expected 188 direct-mapped bytes");
     table
 }
+
+const CP2BYTE: [i16; CP2BYTE_MAX] = build_cp2byte();
 
 pub struct ByteDecoder {
     tokens: Vec<String>,
@@ -32,7 +37,7 @@ impl ByteDecoder {
         Self {
             tokens,
             added,
-            cp2byte: build_cp2byte(),
+            cp2byte: CP2BYTE,
             pending: Vec::new(),
         }
     }
