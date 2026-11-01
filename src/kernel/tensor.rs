@@ -1,4 +1,4 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+﻿#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::gguf::{GgmlType, TensorEntry};
 use crate::kernel::iq;
@@ -1556,7 +1556,6 @@ impl Q38TensorOps for TensorEntry<'_> {
 #[cfg(test)]
 mod speed_probe {
     use super::*;
-    use rayon::prelude::*;
     use std::time::Instant;
 
     fn noise(seed: u64, len: usize) -> Vec<u8> {

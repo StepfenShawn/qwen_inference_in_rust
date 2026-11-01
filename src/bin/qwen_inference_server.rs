@@ -8,7 +8,7 @@ use qwen38_27b_in_rust::kernel::Q38Iq1sRepack;
 use qwen38_27b_in_rust::model::sampler::Sampler;
 use qwen38_27b_in_rust::model::{Q38Model, Q38ModelOps};
 use qwen38_27b_in_rust::prompt::{Effort, ToolParser, render};
-use qwen38_27b_in_rust::tokenizer::{self, ByteDecoder};
+use qwen38_27b_in_rust::tokenizer::{self, decoder::ByteDecoder};
 
 use serde_json::{Value, json};
 use std::collections::HashSet;
