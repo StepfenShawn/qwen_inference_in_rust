@@ -142,7 +142,9 @@ fn run(
         sampler.observe(id);
     }
     // Before the first `</think>` the text is reasoning, afterwards it is answer.
-    let (mut thinking, mut out, mut reason) = (req.thinking, 0u32, "length");
+    let mut thinking = req.thinking;
+    let mut out: u32 = 0;
+    let mut reason = "length";
     let mut parser = ToolParser::default();
     macro_rules! emit {
         ($tok:expr) => {{
@@ -231,7 +233,8 @@ fn run(
 
 /// Reads one HTTP/1.1 request: `(method, path, body)`.
 fn read_http(rd: &mut BufReader<TcpStream>) -> Option<(String, String, Vec<u8>)> {
-    let (mut head, mut len) = (String::new(), 0usize);
+    let mut head = String::new();
+    let mut len = 0;
     loop {
         let mut line = String::new();
         if rd.read_line(&mut line).ok()? == 0 {
@@ -249,7 +252,9 @@ fn read_http(rd: &mut BufReader<TcpStream>) -> Option<(String, String, Vec<u8>)>
     let mut body = vec![0u8; len];
     rd.read_exact(&mut body).ok()?;
     let mut parts = head.lines().next()?.split_whitespace();
-    Some((parts.next()?.to_string(), parts.next()?.to_string(), body))
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    Some((method, path, body))
 }
 
 fn serve(rd: &mut BufReader<TcpStream>, jobs: &Sender<Job>, name: &str) {
@@ -295,11 +300,9 @@ fn chat(w: &mut TcpStream, jobs: &Sender<Job>, name: &str, body: &[u8]) -> bool 
             json!({"error": {"message": "messages[] is required"}})
         );
     };
-    let (id, created, stream) = (
-        format!("chatcmpl-{:x}", now()),
-        now() / 1_000_000_000,
-        parsed["stream"].as_bool().unwrap_or(false),
-    );
+    let id = format!("chatcmpl-{:x}", now());
+    let created = now() / 1_000_000_000;
+    let stream = parsed["stream"].as_bool().unwrap_or(false);
     let thinking = parsed["thinking"].as_bool().unwrap_or(true);
     // `tool_choice: "none"` keeps the declarations out of the prompt entirely.
     let tools: Vec<Value> = match parsed["tools"].as_array() {
@@ -307,7 +310,7 @@ fn chat(w: &mut TcpStream, jobs: &Sender<Job>, name: &str, body: &[u8]) -> bool 
         _ => Vec::new(),
     };
     let prompt = render(messages, thinking, Effort::Xhigh, &tools);
-    println!("{}", prompt);
+
     let req = Req {
         max_tokens: parsed["max_tokens"].as_u64().unwrap_or(1024) as u32,
         temperature: parsed["temperature"].as_f64().unwrap_or(1.0) as f32,
@@ -328,16 +331,24 @@ fn chat(w: &mut TcpStream, jobs: &Sender<Job>, name: &str, body: &[u8]) -> bool 
     {
         return false;
     }
-    if stream && write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").and_then(|_| w.flush()).is_err() {
-        return false;
+    if stream {
+        if write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
+        .and_then(|_| w.flush()).is_err() {
+            return false;
+        }
     }
     let chunk = |delta: Value, finish: Value| {
         json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
     };
-    let (mut text, mut reasoning) = (String::new(), String::new());
+
+    let mut text = String::new();
+    let mut reasoning = String::new();
     let mut calls: Vec<Value> = Vec::new();
-    let (mut prompt_tokens, mut out, mut reason) = (0u32, 0u32, "stop");
+    let mut prompt_tokens: u32 = 0;
+    let mut out: u32 = 0;
+    let mut reason = "stop";
+
     for event in rx {
         match event {
             Event::Delta {
@@ -345,6 +356,7 @@ fn chat(w: &mut TcpStream, jobs: &Sender<Job>, name: &str, body: &[u8]) -> bool 
                 reasoning: think,
             } if stream => {
                 let delta = if think.is_empty() {
+                    // no-thinking
                     json!({"content": content})
                 } else {
                     json!({"reasoning_content": think})
@@ -480,18 +492,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .enable_mtp()
             .map_err(|_| "MTP head unavailable: checkpoint must carry blk.64.nextn.*")?;
     }
-    let name = std::path::Path::new(&path)
+    let model_name = std::path::Path::new(&path)
         .file_name()
         .map(|n| n.to_string_lossy().trim_end_matches(".gguf").to_string())
         .unwrap_or_else(|| "local".into());
 
     let listener = TcpListener::bind((host.as_str(), port))?;
-    println!("server: http://{host}:{port} model={name} context={context} draft={draft}");
+    println!("server: http://{host}:{port} model={model_name} context={context} draft={draft}");
     let (job_tx, job_rx) = channel::<Job>();
-    let (accept_tx, accept_name) = (job_tx.clone(), name.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (jobs, model_name) = (accept_tx.clone(), accept_name.clone());
+            let (jobs, model_name) = (job_tx.clone(), model_name.clone());
             std::thread::spawn(move || {
                 let _ = stream.set_nodelay(true);
                 serve(&mut BufReader::new(stream), &jobs, &model_name);

@@ -16,6 +16,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::sampler::Sampler;
 
+#[derive(PartialEq)]
+enum Mode {
+    Cli,
+    Server(String, u32)
+}
+
 struct Options {
     model: Option<String>,
     prompt: Option<String>,
@@ -31,6 +37,7 @@ struct Options {
     reasoning_effort: Effort,
     mtp_draft: u32,
     threads: Option<usize>,
+    mode: Mode
 }
 
 impl Default for Options {
@@ -54,13 +61,14 @@ impl Default for Options {
             reasoning_effort: Effort::Xhigh,
             mtp_draft: 0,
             threads: None,
+            mode: Mode::Cli
         }
     }
 }
 
 fn usage() {
     eprintln!(
-        "usage: qwen38 --model MODEL.gguf [--prompt TEXT] [options]\n\
+        "usage: qwen38 [server] --model MODEL.gguf [--prompt TEXT] [options]\n\
          \x20 --prompt TEXT       run one request\n\
          \x20 --system TEXT       system instruction\n\
          \x20 --max-tokens N      maximum generated tokens (default: 1024)\n\
@@ -74,7 +82,9 @@ fn usage() {
          \x20 --threads N         worker threads for the kernels (default: one per core,\n\
          \x20                     also honoured through RAYON_NUM_THREADS)\n\
          \x20 --mtp-draft N       greedy speculative decoding with N drafts (0 = off)\n\
-         \x20 --seed N            sampling seed"
+         \x20 --seed N            sampling seed\n\
+         \x20 --host IP           launch a server\n\
+         \x20 --port 8080         server port"
     );
 }
 
@@ -91,6 +101,7 @@ fn parse_args() -> Result<Options, String> {
                 .ok_or_else(|| format!("{name} requires a value"))
         };
         match arg.as_str() {
+            "server" => opts.mode = Mode::Server("127.0.0.1".into(), 8080),
             "--model" => opts.model = Some(next("--model")?),
             "--prompt" => opts.prompt = Some(next("--prompt")?),
             "--system" => opts.system = Some(next("--system")?),
@@ -153,6 +164,22 @@ fn parse_args() -> Result<Options, String> {
                 usage();
                 std::process::exit(0);
             }
+            "--host" => {
+                match &mut opts.mode {
+                    Mode::Cli => return Err("host must set in server mode".to_string()),
+                    Mode::Server(host, _) => {
+                        *host = next("--host")?;
+                    }
+                }
+            }
+            "--port" => {
+                match &mut opts.mode {
+                    Mode::Cli => return Err("port must set in server mode".to_string()),
+                    Mode::Server(_, port) => {
+                        *port = next("--port")?.parse().map_err(|_| "invalid --port".to_string())?;
+                    }
+                }
+            }
             other if !other.starts_with("--") && opts.model.is_none() => {
                 opts.model = Some(other.to_string());
             }
@@ -163,12 +190,13 @@ fn parse_args() -> Result<Options, String> {
     if opts.model.is_none() {
         return Err("--model is required".to_string());
     }
-    if opts.prompt.is_none() {
+    if opts.prompt.is_none() && opts.mode == Mode::Cli {
         return Err("--prompt is required".to_string());
     }
     Ok(opts)
 }
 
+// TODO: integrate `qwen_inference_server` here.
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let options = parse_args()?;
     // The kernels draw from rayon's global pool, so `--threads` has to be
