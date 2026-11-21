@@ -1,25 +1,27 @@
 mod gguf;
 mod kernel;
 mod model;
-// The CLI only renders prompts; `ToolParser` belongs to the HTTP server.
-#[allow(dead_code)]
 mod prompt;
+mod server;
 mod tokenizer;
 
 use gguf::Gguf;
 use kernel::Q38Iq1sRepack;
 use model::{Q38Model, Q38ModelOps};
 use prompt::Effort;
-use std::collections::HashSet;
-use std::io::{self, Write};
+use qwen38_27b_in_rust::TokenState;
+use std::io::{self, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::mpsc::channel;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokenizers::Tokenizer;
 
 use crate::model::sampler::Sampler;
 
 #[derive(PartialEq)]
 enum Mode {
     Cli,
-    Server(String, u32)
+    Server(String, u32),
 }
 
 struct Options {
@@ -37,7 +39,7 @@ struct Options {
     reasoning_effort: Effort,
     mtp_draft: u32,
     threads: Option<usize>,
-    mode: Mode
+    mode: Mode,
 }
 
 impl Default for Options {
@@ -61,7 +63,7 @@ impl Default for Options {
             reasoning_effort: Effort::Xhigh,
             mtp_draft: 0,
             threads: None,
-            mode: Mode::Cli
+            mode: Mode::Cli,
         }
     }
 }
@@ -69,7 +71,7 @@ impl Default for Options {
 fn usage() {
     eprintln!(
         "usage: qwen38 [server] --model MODEL.gguf [--prompt TEXT] [options]\n\
-         \x20 --prompt TEXT       run one request\n\
+         \x20 --prompt TEXT       run one request (required unless `server` is given)\n\
          \x20 --system TEXT       system instruction\n\
          \x20 --max-tokens N      maximum generated tokens (default: 1024)\n\
          \x20 --context N         context capacity (default: 4096)\n\
@@ -83,8 +85,8 @@ fn usage() {
          \x20                     also honoured through RAYON_NUM_THREADS)\n\
          \x20 --mtp-draft N       greedy speculative decoding with N drafts (0 = off)\n\
          \x20 --seed N            sampling seed\n\
-         \x20 --host IP           launch a server\n\
-         \x20 --port 8080         server port"
+         \x20 --host IP           bind address, server mode only (default: 127.0.0.1)\n\
+         \x20 --port 8080         listen port, server mode only (default: 8080)"
     );
 }
 
@@ -164,22 +166,20 @@ fn parse_args() -> Result<Options, String> {
                 usage();
                 std::process::exit(0);
             }
-            "--host" => {
-                match &mut opts.mode {
-                    Mode::Cli => return Err("host must set in server mode".to_string()),
-                    Mode::Server(host, _) => {
-                        *host = next("--host")?;
-                    }
+            "--host" => match &mut opts.mode {
+                Mode::Cli => return Err("host must set in server mode".to_string()),
+                Mode::Server(host, _) => {
+                    *host = next("--host")?;
                 }
-            }
-            "--port" => {
-                match &mut opts.mode {
-                    Mode::Cli => return Err("port must set in server mode".to_string()),
-                    Mode::Server(_, port) => {
-                        *port = next("--port")?.parse().map_err(|_| "invalid --port".to_string())?;
-                    }
+            },
+            "--port" => match &mut opts.mode {
+                Mode::Cli => return Err("port must set in server mode".to_string()),
+                Mode::Server(_, port) => {
+                    *port = next("--port")?
+                        .parse()
+                        .map_err(|_| "invalid --port".to_string())?;
                 }
-            }
+            },
             other if !other.starts_with("--") && opts.model.is_none() => {
                 opts.model = Some(other.to_string());
             }
@@ -196,52 +196,14 @@ fn parse_args() -> Result<Options, String> {
     Ok(opts)
 }
 
-// TODO: integrate `qwen_inference_server` here.
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let options = parse_args()?;
-    // The kernels draw from rayon's global pool, so `--threads` has to be
-    // installed before the first parallel region runs.
-    if let Some(threads) = options.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .map_err(|error| format!("unable to start {threads} worker threads: {error}"))?;
-    }
-    let model_path = options.model.as_deref().unwrap();
-
-    let mut gguf = Gguf::open(model_path)?;
-    // IQ1_S checkpoints get a second, SIMD-friendly view of their weight
-    // blocks. The mapping stays authoritative; this only adds derived state.
-    if let Err(error) = gguf.prepare_iq1_s_repacks() {
-        eprintln!("qwen38: IQ1 runtime repack unavailable; using packed weights ({error})");
-    }
-    let (tokenizer, mut decoder) = tokenizer::build_tokenizer_and_decoder_from_gguf(&gguf)?;
-    let eos = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(0);
-
-    let control_tokens: HashSet<u32> = tokenizer::get_all_control_token_ids(&gguf)
-        .into_iter()
-        .collect();
-    let think_close = tokenizer.token_to_id("</think>");
-
-    let mut model =
-        Q38Model::open_gguf(&gguf, options.context).map_err(|_| "unable to open model")?;
-
-    if options.mtp_draft > 0 {
-        model
-            .enable_mtp()
-            .map_err(|_| "MTP head unavailable: checkpoint must carry blk.64.nextn.*")?;
-        eprintln!(
-            "qwen38: MTP speculative decoding on (draft={})",
-            options.mtp_draft
-        );
-    }
-
-    let prompt = prompt::render_simple(
-        options.prompt.as_deref().unwrap(),
-        options.system.as_deref(),
-        options.thinking,
-        options.reasoning_effort,
-    );
+fn cli_mode_entry(
+    model: &mut Q38Model<'_>,
+    tokenizer: &Tokenizer,
+    decoder: &mut tokenizer::decoder::ByteDecoder,
+    state: &TokenState,
+    prompt: &String,
+    opts: &Options,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encoding = tokenizer.encode(prompt.as_str(), false)?;
     let ids: Vec<u32> = encoding.get_ids().to_vec();
     if ids.is_empty() {
@@ -250,11 +212,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vocab = model.vocab_size() as usize;
     let mut sampler = Sampler::new(
-        options.seed,
-        options.temperature,
-        options.top_k,
-        options.top_p,
-        options.presence_penalty,
+        opts.seed,
+        opts.temperature,
+        opts.top_k,
+        opts.top_p,
+        opts.presence_penalty,
         vocab,
     );
     for &id in &ids {
@@ -267,30 +229,30 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut last_ready = started;
     let mut generated = 0u32;
 
-    if options.thinking {
+    if opts.thinking {
         print!("<think>\n");
     }
 
-    let mut closed_thinking = !options.thinking;
+    let mut closed_thinking = !opts.thinking;
 
     macro_rules! emit {
         ($token:expr) => {{
             let token: u32 = $token;
-            if token == eos {
+            if token == state.eos {
                 false
             } else {
                 if generated == 0 {
                     first_ready = Some(Instant::now());
                 }
                 sampler.observe(token);
-                if !control_tokens.contains(&token) {
+                if !state.control.contains(&token) {
                     let text = decoder.push(token);
                     if !text.is_empty() {
                         print!("{text}");
                         io::stdout().flush().ok();
                     }
                 }
-                if Some(token) == think_close {
+                if Some(token) == state.think_close {
                     closed_thinking = true;
                 }
                 generated += 1;
@@ -300,15 +262,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }};
     }
 
-    let mut accepted = vec![0u32; options.mtp_draft as usize + 1];
+    let mut accepted = vec![0u32; opts.mtp_draft as usize + 1];
     let mut pending = sampler.sample(logits);
-    while generated < options.max_tokens {
+    while generated < opts.max_tokens {
         if !emit!(pending) {
             break;
         }
         // `emit!` may have just filled the budget; drafting with zero slots
         // would otherwise reach `speculative_greedy` and be rejected there.
-        if generated >= options.max_tokens {
+        if generated >= opts.max_tokens {
             break;
         }
         let room = model.context_length() - model.position();
@@ -320,19 +282,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             break;
         }
 
-        if options.mtp_draft == 0 {
+        if opts.mtp_draft == 0 {
             let logits = model.forward_token(pending).map_err(|_| "forward failed")?;
             pending = sampler.sample(logits);
             continue;
         }
 
         // draft 必须 <= 剩余 context（内核会校验）且 <= 剩余预算
-        let draft = options
-            .mtp_draft
-            .min(options.max_tokens - generated)
-            .min(room);
+        let draft = opts.mtp_draft.min(opts.max_tokens - generated).min(room);
         let (_, consumed) = model
-            .speculative_greedy(pending, eos, draft, &mut accepted[..draft as usize])
+            .speculative_greedy(pending, state.eos, draft, &mut accepted[..draft as usize])
             .map_err(|_| "speculative decode failed")?;
 
         // `accepted` 里最后一个 token 还没有送进 target，下一轮它才会作为
@@ -341,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug_assert!(n >= 1);
         let mut halted = false;
         for &token in &accepted[..n - 1] {
-            if generated >= options.max_tokens || !emit!(token) {
+            if generated >= opts.max_tokens || !emit!(token) {
                 halted = true;
                 break;
             }
@@ -359,7 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         io::stdout().flush().ok();
     }
 
-    let truncated = generated >= options.max_tokens;
+    let truncated = generated >= opts.max_tokens;
     if truncated && !closed_thinking {
         print!("\n</think>\n\n");
         io::stdout().flush().ok();
@@ -384,7 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             eprintln!(" TPOT={tpot:.3}s");
         }
     }
-    if options.mtp_draft > 0 && model.spec_batches > 0 {
+    if opts.mtp_draft > 0 && model.spec_batches > 0 {
         let drafted = model.spec_drafted.max(1) as f64;
         eprintln!(
             " MTP acceptance={:.1}% ({}/{} drafts confirmed in {} batches, {:.2} tokens/batch)",
@@ -398,10 +357,129 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if truncated {
         eprintln!(
             "output reached --max-tokens={}; raise the limit to continue longer",
-            options.max_tokens
+            opts.max_tokens
         );
     }
     eprintln!("]");
-
     Ok(())
+}
+
+fn server_mode_entry(
+    model: &mut Q38Model<'_>,
+    tokenizer: &Tokenizer,
+    decoder: &mut tokenizer::decoder::ByteDecoder,
+    state: &TokenState,
+    opts: &Options,
+    host: &String,
+    port: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let model_name = std::path::Path::new(opts.model.as_ref().unwrap())
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".gguf").to_string())
+        .unwrap_or_else(|| "local".into());
+
+    let listener = TcpListener::bind(format!("{host}:{port}"))?;
+    println!(
+        "server: http://{host}:{port} model={model_name} context={} draft={}",
+        opts.context, opts.mtp_draft
+    );
+    let (job_tx, job_rx) = channel::<server::web::Job>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (jobs, model_name) = (job_tx.clone(), model_name.clone());
+            std::thread::spawn(move || {
+                let _ = stream.set_nodelay(true);
+                server::web::serve(&mut BufReader::new(stream), &jobs, &model_name);
+            });
+        }
+    });
+
+    // The model thread: requests are decoded one at a time, which is also the
+    // bandwidth-optimal schedule for a single checkpoint.
+    for job in job_rx {
+        let ids = match tokenizer.encode(job.prompt.as_str(), false) {
+            Ok(encoding) => encoding.get_ids().to_vec(),
+            Err(error) => {
+                let _ = job
+                    .sink
+                    .send(server::Event::Fail(format!("tokenizer: {error}")));
+                continue;
+            }
+        };
+        println!("Input toks: {}", ids.len());
+        if let Err(message) = server::run(model, &state, decoder, &job.req, &ids, &job.sink) {
+            let _ = job.sink.send(server::Event::Fail(message));
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let options = parse_args()?;
+    // The kernels draw from rayon's global pool, so `--threads` has to be
+    // installed before the first parallel region runs.
+    if let Some(threads) = options.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .map_err(|error| format!("unable to start {threads} worker threads: {error}"))?;
+    }
+    let model_path = options.model.as_deref().unwrap();
+
+    let mut gguf = Gguf::open(model_path)?;
+    // IQ1_S checkpoints get a second, SIMD-friendly view of their weight
+    // blocks. The mapping stays authoritative; this only adds derived state.
+    if let Err(error) = gguf.prepare_iq1_s_repacks() {
+        eprintln!("qwen38: IQ1 runtime repack unavailable; using packed weights ({error})");
+    }
+    let (tokenizer, mut decoder) = tokenizer::build_tokenizer_and_decoder_from_gguf(&gguf)?;
+    let state = TokenState {
+        eos: gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(0),
+        think_close: tokenizer.token_to_id("</think>"),
+        control: tokenizer::get_all_control_token_ids(&gguf)
+            .into_iter()
+            .collect(),
+        draft: options.mtp_draft,
+    };
+
+    let mut model =
+        Q38Model::open_gguf(&gguf, options.context).map_err(|_| "unable to open model")?;
+
+    if options.mtp_draft > 0 {
+        model
+            .enable_mtp()
+            .map_err(|_| "MTP head unavailable: checkpoint must carry blk.64.nextn.*")?;
+        eprintln!(
+            "qwen38: MTP speculative decoding on (draft={})",
+            options.mtp_draft
+        );
+    }
+
+    match options.mode {
+        Mode::Cli => {
+            let prompt = prompt::render_simple(
+                options.prompt.as_deref().unwrap(),
+                options.system.as_deref(),
+                options.thinking,
+                options.reasoning_effort,
+            );
+            cli_mode_entry(
+                &mut model,
+                &tokenizer,
+                &mut decoder,
+                &state,
+                &prompt,
+                &options,
+            )
+        }
+        Mode::Server(ref host, port) => server_mode_entry(
+            &mut model,
+            &tokenizer,
+            &mut decoder,
+            &state,
+            &options,
+            &host,
+            port,
+        ),
+    }
 }

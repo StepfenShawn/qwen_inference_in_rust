@@ -16,8 +16,9 @@ the MTP speculative decoder and the sampler are all hand-written, and the whole 
 
 # Usage
 ```
-qwen38_27b_in_rust --model MODEL.gguf [--prompt TEXT] [options]
-  --prompt TEXT       run one request
+qwen38_27b_in_rust [server] --model MODEL.gguf [--prompt TEXT] [options]
+  server              serve the HTTP API instead of one prompt
+  --prompt TEXT       run one request (required unless `server` is given)
   --system TEXT       system instruction
   --max-tokens N      maximum generated tokens (default: 1024)
   --context N         context capacity (default: 4096)
@@ -31,6 +32,8 @@ qwen38_27b_in_rust --model MODEL.gguf [--prompt TEXT] [options]
                       also honoured through RAYON_NUM_THREADS)
   --seed N            sampling seed
   --mtp-draft N       greedy speculative decoding with N drafts (0 = off)
+  --host IP           bind address, server mode only (default: 127.0.0.1)
+  --port N            listen port, server mode only (default: 8080)
 ```
 example:  
 ```
@@ -50,19 +53,11 @@ speculative decoding(speedup ~1.8×):
 ./qwen38_27b_in_rust --model Qwen3.8-27B-UD-Q4_K_M.gguf --prompt Hello \
   --max-tokens 256 --context 1024 --temperature 0 --mtp-draft 3
 ```
-
-# HTTP server
-`qwen_inference_server` is a second binary in the same crate that serves the engine over an
-OpenAI-compatible HTTP API. It is hand-written on `std::net::TcpListener` — no async runtime,
-no web framework — and the only added dependency is `serde_json`, which `tokenizers` already
-pulls in.
-
+http server:
 ```
-./qwen_inference_server --model Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080
-  --context N     context capacity (default: 4096)
-  --threads N     worker threads for the kernels
-  --mtp-draft N   greedy speculative decoding, temperature 0 only (0 = off)
+./qwen38_27b_in_rust server --model Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080
   --host ADDR     bind address (default: 127.0.0.1)
+  --port N        listen port (default: 8080)
 ```
 
 # Build
