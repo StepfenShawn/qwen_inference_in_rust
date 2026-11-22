@@ -3,6 +3,7 @@ mod kernel;
 mod model;
 mod prompt;
 mod server;
+mod tensor;
 mod tokenizer;
 
 use gguf::Gguf;

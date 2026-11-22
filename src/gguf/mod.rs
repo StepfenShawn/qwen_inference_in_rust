@@ -3,7 +3,7 @@ pub mod entry;
 use memmap2::Mmap;
 use std::{fs::File, path::Path};
 
-pub type GgmlType = crate::gguf::entry::GgmlType;
+pub type GgmlType = crate::tensor::dtype::DType;
 pub type GgufString<'a> = crate::gguf::entry::GgufString<'a>;
 pub type MetaEntry<'a> = crate::gguf::entry::MetaEntry<'a>;
 pub type MetaType = crate::gguf::entry::MetaType;

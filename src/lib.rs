@@ -8,6 +8,7 @@ pub mod kernel;
 pub mod model;
 pub mod prompt;
 pub mod server;
+pub mod tensor;
 pub mod tokenizer;
 
 /// model-independent token state
