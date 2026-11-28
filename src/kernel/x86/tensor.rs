@@ -2,10 +2,10 @@
 
 //! AVX2 tensor kernels.
 
-use crate::kernel::Q38_Q8_K_TILE;
-use crate::kernel::Q38Q8KBlock;
 use crate::kernel::quant::f16_to_f32;
 use crate::kernel::tensor::{read_f32, read_u16, scale_min_k4, unpack_q3_scales};
+use crate::kernel::Q38Q8KBlock;
+use crate::kernel::Q38_Q8_K_TILE;
 use std::arch::x86_64::*;
 
 #[inline]

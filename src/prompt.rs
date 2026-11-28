@@ -1,6 +1,6 @@
 //! Prompt construction and tool-call parsing.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Reasoning-effort instruction prepended to the system block. These two
 /// strings are template text, not invented here.
